@@ -1,5 +1,7 @@
 # ai-code-reviewer
 
+![Setup and usage walkthrough](images/tutorial.gif)
+
 Python stdlib webhook service for GitLab merge requests and GitHub pull requests. It fetches diffs, calls the Hermes Agent CLI, and posts review feedback. Hermes and a configured model provider are required; the server has no Python package dependencies.
 
 Choose **Python direct** to use an existing host Hermes installation, or **Docker** to run the server with Hermes included in the image. Neither mode includes model credentials.
