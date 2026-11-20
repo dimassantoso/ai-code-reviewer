@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""Tests for the webhook review server. Run: python3 -m unittest -v"""
+import base64
+import hashlib
+import hmac
+import json
+import os
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import patch
+from urllib.request import Request, urlopen
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import server  # noqa: E402
+
+SECRET = "s3cret"
+
+
+def sign_github(raw, secret=SECRET):
+    return "sha256=" + hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
+
+
+def sign_standard(raw, secret="whsec_" + base64.b64encode(b"k" * 24).decode(), msg_id="msg-1", ts=None):
+    ts = str(int(time.time())) if ts is None else str(ts)
+    key = base64.b64decode(secret[6:])
+    signature = "v1," + base64.b64encode(hmac.new(key, f"{msg_id}.{ts}.".encode() + raw, hashlib.sha256).digest()).decode()
+    return {"webhook-id": msg_id, "webhook-timestamp": ts, "webhook-signature": signature}, secret
+
+
+class VerificationTests(unittest.TestCase):
+    def test_github_signature(self):
+        raw = b'{"a":1}'
+        self.assertTrue(server.verify("github", {"X-Hub-Signature-256": sign_github(raw)}, raw, SECRET))
+        self.assertFalse(server.verify("github", {"X-Hub-Signature-256": sign_github(raw, "other")}, raw, SECRET))
+        self.assertFalse(server.verify("github", {}, raw, SECRET))
+        self.assertFalse(server.verify("github", {"X-Hub-Signature-256": sign_github(raw)}, raw, ""))
+
+    def test_gitlab_token(self):
+        raw = b'{"a":1}'
+        self.assertTrue(server.verify("gitlab", {"X-Gitlab-Token": SECRET}, raw, SECRET))
+        self.assertFalse(server.verify("gitlab", {"X-Gitlab-Token": "nope"}, raw, SECRET))
+
+    def test_standard_webhooks(self):
+        raw = b'{"a":1}'
+        headers, secret = sign_standard(raw)
+        self.assertTrue(server.verify("gitlab", headers, raw, secret))
+        self.assertFalse(server.verify("gitlab", headers, b'{"a":2}', secret))
+
+    def test_standard_webhooks_rejects_stale_timestamp(self):
+        raw = b"{}"
+        headers, secret = sign_standard(raw, ts=int(time.time()) - 3600)
+        self.assertFalse(server.verify("gitlab", headers, raw, secret))
+
+    def test_standard_webhooks_rejects_malformed_secret(self):
+        raw = b"{}"
+        headers, _ = sign_standard(raw)
+        self.assertFalse(server.verify("gitlab", headers, raw, "whsec_!!!notbase64"))
+
+
+class ConfigTests(unittest.TestCase):
+    def setUp(self):
+        self.saved = dict(os.environ)
+        for key in ("GITLAB_TOKEN", "GITHUB_TOKEN", "GITLAB_WEBHOOK_SECRET", "GITHUB_WEBHOOK_SECRET", "WEBHOOK_SECRET"):
+            os.environ.pop(key, None)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self.saved)
+
+    def test_requires_token(self):
+        with self.assertRaises(ValueError):
+            server.load_config()
+
+    def test_requires_secret(self):
+        os.environ["GITLAB_TOKEN"] = "t"
+        with self.assertRaises(ValueError):
+            server.load_config()
+
+    def test_rejects_plain_http_url(self):
+        os.environ.update(GITLAB_TOKEN="t", GITLAB_WEBHOOK_SECRET=SECRET, GITLAB_URL="http://gitlab.internal")
+        with self.assertRaises(ValueError):
+            server.load_config()
+
+    def test_accepts_both_platforms(self):
+        os.environ.update(GITLAB_TOKEN="t", GITHUB_TOKEN="g", WEBHOOK_SECRET=SECRET)
+        config = server.load_config()
+        self.assertEqual(set(config), {"gitlab", "github"})
+        self.assertEqual(config["github"]["url"], "https://api.github.com")
+
+
+class HandlerTests(unittest.TestCase):
+    def setUp(self):
+        server._seen.clear()
+        self.config = {"github": {"token": "t", "secret": SECRET, "url": "https://api.github.com"}}
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        self.httpd.config = self.config
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def post(self, path, raw, headers=None):
+        request = Request(self.base + path, data=raw, headers=headers or {}, method="POST")
+        try:
+            with urlopen(request, timeout=10) as response:
+                return response.status, response.read().decode()
+        except Exception as error:  # HTTPError carries the status we assert on
+            return error.code, error.read().decode()
+
+    def test_health(self):
+        with urlopen(self.base + "/health", timeout=10) as response:
+            self.assertEqual(response.read(), b"ok")
+
+    def test_unknown_route(self):
+        self.assertEqual(self.post("/nope", b"{}")[0], 404)
+
+    def test_rejects_missing_and_bad_signature(self):
+        raw = json.dumps({"action": "opened"}).encode()
+        with patch.object(server, "process") as process:
+            self.assertEqual(self.post("/gh-review", raw)[0], 403)
+            self.assertEqual(self.post("/gh-review", raw, {"X-Hub-Signature-256": "sha256=deadbeef"})[0], 403)
+            process.assert_not_called()
+
+    def test_dispatches_signed_github_event(self):
+        raw = json.dumps({"action": "opened"}).encode()
+        headers = {"X-Hub-Signature-256": sign_github(raw), "X-GitHub-Event": "pull_request"}
+        done = threading.Event()
+
+        def fake_process(platform, event, payload, config):
+            done.set()
+            return True
+
+        with patch.object(server, "process", side_effect=fake_process) as process:
+            status, body = self.post("/gh-review", raw, headers)
+            self.assertTrue(done.wait(5))
+        self.assertEqual((status, body), (202, "accepted"))
+        self.assertEqual(process.call_args[0][:2], ("github", "pull_request"))
+
+    def test_duplicate_delivery_is_not_reviewed_twice(self):
+        raw = json.dumps({"action": "opened", "id": "dup-1"}).encode()
+        headers = {"X-Hub-Signature-256": sign_github(raw), "X-GitHub-Event": "pull_request"}
+        once = threading.Event()
+
+        def fake_process(*args):
+            once.set()
+            return True
+
+        with patch.object(server, "process", side_effect=fake_process) as process:
+            self.assertEqual(self.post("/gh-review", raw, headers)[0], 202)
+            self.assertTrue(once.wait(5))
+            self.assertEqual(self.post("/gh-review", raw, headers), (200, "duplicate"))
+        self.assertEqual(process.call_count, 1)
+
+    def test_unconfigured_platform_is_404(self):
+        raw = json.dumps({"action": "opened"}).encode()
+        status, _ = self.post("/gl-review", raw, {"X-Gitlab-Token": SECRET})
+        self.assertEqual(status, 404)
+
+    def test_rejects_non_json_after_signature(self):
+        raw = b"not json"
+        status, _ = self.post("/gh-review", raw, {"X-Hub-Signature-256": sign_github(raw)})
+        self.assertEqual(status, 400)
+
+    def test_rejects_oversized_body(self):
+        status, _ = self.post("/gh-review", b"x", {"Content-Length": str(server.MAX_BODY + 1)})
+        self.assertEqual(status, 413)
+
+
+class ApiStub(BaseHTTPRequestHandler):
+    notes = []
+    diff = "--- a.py\n+print(1)\n"
+
+    def do_GET(self):
+        if self.path == "/api/v4/projects/1/merge_requests/2/changes?access_raw_diffs=true":
+            payload = {"changes": [{"new_path": "a.py", "diff": "+print(1)"}], "overflow": False}
+        elif self.path == "/api/v4/projects/1/merge_requests/2":
+            payload = {"iid": 2}
+        else:
+            self.send_response(404)
+            self.end_headers()
+            return
+        body = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        ApiStub.notes.append((self.path, json.loads(body), self.headers.get("PRIVATE-TOKEN")))
+        payload = b'{"id": 1}'
+        self.send_response(201)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *args):
+        pass
+
+
+class EndToEndTests(unittest.TestCase):
+    """Real HTTP server + fake GitLab API + stub hermes binary. No external network."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.api = ThreadingHTTPServer(("127.0.0.1", 0), ApiStub)
+        threading.Thread(target=cls.api.serve_forever, daemon=True).start()
+        cls.bin_dir = tempfile.mkdtemp()
+        cls.hermes = os.path.join(cls.bin_dir, "hermes")
+        with open(cls.hermes, "w") as handle:
+            handle.write("#!/bin/sh\ncat > \"$0.stdin\"\nprintf '## Review\\n\\nDiff looks fine.\\nVERDICT: APPROVE\\n'\n")
+        os.chmod(cls.hermes, 0o755)
+        cls.config = {
+            "gitlab": {"token": "gl-token", "secret": SECRET, "url": f"http://127.0.0.1:{cls.api.server_address[1]}"}
+        }
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        cls.httpd.config = cls.config
+        threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        for httpd in (cls.httpd, cls.api):
+            httpd.shutdown()
+            httpd.server_close()
+
+    def setUp(self):
+        server._seen.clear()
+
+    def post(self, raw, headers):
+        request = Request(self.base + "/gl-review", data=raw, headers=headers, method="POST")
+        try:
+            with urlopen(request, timeout=30) as response:
+                return response.status, response.read().decode()
+        except Exception as error:
+            return error.code, error.read().decode()
+
+    def wait_for_notes(self, count=1, timeout=15):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if len(ApiStub.notes) >= count:
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_review_end_to_end(self):
+        ApiStub.notes.clear()
+        payload = {
+            "object_kind": "merge_request",
+            "project": {"id": 1},
+            "object_attributes": {"iid": 2, "action": "open"},
+        }
+        raw = json.dumps(payload).encode()
+        with patch.dict(os.environ, {"HERMES_BIN": self.hermes, "GITLAB_TOKEN": "gl-token", "WEBHOOK_SECRET": "leak"}):
+            status, body = self.post(raw, {"X-Gitlab-Token": SECRET, "X-Gitlab-Event": "Merge Request Hook"})
+            self.assertEqual((status, body), (202, "accepted"))
+            self.assertTrue(self.wait_for_notes())
+        self.assertEqual(len(ApiStub.notes), 1)
+        path, posted, token = ApiStub.notes[0]
+        self.assertEqual(path, "/api/v4/projects/1/merge_requests/2/notes")
+        self.assertEqual(token, "gl-token")
+        self.assertIn("VERDICT: APPROVE", posted["body"])
+        with open(self.hermes + ".stdin") as handle:
+            prompt = handle.read()
+        self.assertIn("+print(1)", prompt)
+        self.assertIn("untrusted", prompt)
+
+    def test_ignores_unrelated_event(self):
+        ApiStub.notes.clear()
+        raw = json.dumps({"object_kind": "push", "project": {"id": 1}}).encode()
+        status, body = self.post(raw, {"X-Gitlab-Token": SECRET, "X-Gitlab-Event": "Push Hook"})
+        self.assertEqual((status, body), (202, "accepted"))
+        self.assertFalse(self.wait_for_notes(timeout=1))
+        self.assertEqual(ApiStub.notes, [])
+
+    def test_rejects_oversized_diff(self):
+        ApiStub.notes.clear()
+        raw = json.dumps({"object_kind": "merge_request", "project": {"id": 1},
+                          "object_attributes": {"iid": 2, "action": "open"}}).encode()
+        with patch.object(server, "MAX_DIFF", 5), patch.dict(os.environ, {"HERMES_BIN": self.hermes}):
+            self.assertEqual(self.post(raw, {"X-Gitlab-Token": SECRET, "X-Gitlab-Event": "Merge Request Hook"})[0], 202)
+            self.assertFalse(self.wait_for_notes(timeout=1))
+        self.assertEqual(ApiStub.notes, [])
+
+
+class GitHubFlowTests(unittest.TestCase):
+    CONFIG = {"token": "gh", "secret": SECRET, "url": "https://api.github.com"}
+
+    def payload(self, action="opened"):
+        return {"action": action, "number": 5, "repository": {"full_name": "acme/widgets"}}
+
+    def test_review_posts_comment_review(self):
+        diff = b"--- a/x.py\n+print(1)\n"
+        with patch.object(server, "api", side_effect=[diff, b"{}"]) as api, \
+                patch.object(server, "run_hermes", return_value="## Review\nVERDICT: APPROVE") as hermes:
+            self.assertTrue(server.process("github", "pull_request", self.payload(), self.CONFIG))
+        self.assertEqual(hermes.call_args[0][0], diff.decode())
+        path, posted = api.call_args_list[1][0][3], api.call_args_list[1][0][4]
+        self.assertEqual(path, "/repos/acme/widgets/pulls/5/reviews")
+        self.assertEqual(posted, {"body": "## Review\nVERDICT: APPROVE", "event": "COMMENT"})
+
+    def test_ignores_other_actions_and_events(self):
+        with patch.object(server, "api") as api:
+            self.assertFalse(server.process("github", "pull_request", self.payload("closed"), self.CONFIG))
+            self.assertFalse(server.process("github", "issue_comment", self.payload(), self.CONFIG))
+        api.assert_not_called()
+
+    def test_rejects_bad_destination(self):
+        bad_names = ("../secrets", "a/b/c", "acme/widgets/../../x", "")
+        for name in bad_names:
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                server.process("github", "pull_request",
+                               {"action": "opened", "number": 1, "repository": {"full_name": name}}, self.CONFIG)
+        with patch.object(server, "api") as api, self.assertRaises(ValueError):
+            server.process("github", "pull_request", {"action": "opened", "repository": {"full_name": "a/b"}}, self.CONFIG)
+        api.assert_not_called()
+
+    def test_empty_diff_skips_review(self):
+        with patch.object(server, "api", return_value=b"  \n"), patch.object(server, "run_hermes") as hermes:
+            self.assertFalse(server.process("github", "pull_request", self.payload(), self.CONFIG))
+        hermes.assert_not_called()
+
+
+class GitLabFlowTests(unittest.TestCase):
+    CONFIG = {"token": "gl", "secret": SECRET, "url": "https://gitlab.example.com"}
+
+    def test_overflow_blocks_review(self):
+        changes = b'{"changes": [], "overflow": true}'
+        with patch.object(server, "api", return_value=changes), patch.object(server, "run_hermes") as hermes:
+            with self.assertRaises(ValueError):
+                server.process("gitlab", "Merge Request Hook", {
+                    "object_kind": "merge_request", "project": {"id": 1},
+                    "object_attributes": {"iid": 2, "action": "update"}}, self.CONFIG)
+        hermes.assert_not_called()
+
+
+class ClaimTests(unittest.TestCase):
+    def setUp(self):
+        server._seen.clear()
+
+    def test_duplicate_detected_and_released(self):
+        raw = b'{"x":1}'
+        self.assertTrue(server.claim("gitlab", raw))
+        self.assertFalse(server.claim("gitlab", raw))
+        self.assertTrue(server.claim("github", raw))  # platform-scoped
+        server.release("gitlab", raw)
+        self.assertTrue(server.claim("gitlab", raw))
+
+    def test_queue_bound_rejects_new_work(self):
+        for index in range(1000):
+            server.claim("gitlab", str(index).encode())
+        with self.assertRaises(OverflowError):
+            server.claim("gitlab", b"one-too-many")
+
+    def test_stale_entries_expire(self):
+        server._seen[("gitlab", b"old")] = time.monotonic() - 301
+        self.assertTrue(server.claim("gitlab", b"new"))
+        self.assertNotIn(("gitlab", b"old"), server._seen)
+
+
+class HermesTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.bin = os.path.join(self.tmp, "hermes")
+        self.saved = dict(os.environ)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self.saved)
+
+    def script(self, body):
+        with open(self.bin, "w") as handle:
+            handle.write("#!/bin/sh\n" + body)
+        os.chmod(self.bin, 0o755)
+        os.environ["HERMES_BIN"] = self.bin
+
+    def test_returns_stdout_and_scrubs_secrets(self):
+        self.script('cat >/dev/null\nprintf "%s|%s" "$GITLAB_TOKEN" "$HERMES_MODEL"\n')
+        os.environ.update(GITLAB_TOKEN="leak", HERMES_MODEL="m1")
+        self.assertEqual(server.run_hermes("diff"), "|m1")
+
+    def test_strips_session_id_trailer(self):
+        self.script('cat >/dev/null\nprintf "review text\\n\\nsession_id: local-abc\\n"\n')
+        self.assertEqual(server.run_hermes("diff"), "review text")
+
+    def test_empty_output_is_error(self):
+        self.script("cat >/dev/null\n")
+        with self.assertRaises(ValueError):
+            server.run_hermes("diff")
+
+    def test_nonzero_exit_is_error(self):
+        self.script("exit 3\n")
+        with self.assertRaises(Exception):
+            server.run_hermes("diff")
+
+    def test_timeout_is_error(self):
+        self.script("sleep 5\n")
+        os.environ["HERMES_TIMEOUT_S"] = "1"
+        with self.assertRaises(Exception):
+            server.run_hermes("diff")
+
+
+if __name__ == "__main__":
+    unittest.main()

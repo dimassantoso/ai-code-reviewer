@@ -1,0 +1,22 @@
+services:
+  reviewer:
+    build: .
+    image: ai-code-reviewer
+    container_name: ai-code-reviewer
+    restart: unless-stopped
+    # Loopback only: the webhook endpoints are unauthenticated apart from the
+    # signature check, so publish through a tunnel, not straight onto the LAN.
+    ports:
+      - "127.0.0.1:9877:9877"
+    env_file:
+      - .env
+    environment:
+      BIND_HOST: 0.0.0.0
+      BIND_PORT: "9877"
+      # Host user that should own ./hermes-home (image remaps its internal user).
+      HERMES_UID: "${HERMES_UID:-1000}"
+      HERMES_GID: "${HERMES_GID:-1000}"
+    volumes:
+      # Hermes home: config.yaml (model/provider), .env keys, sessions, logs.
+      # Persist it or every restart re-seeds an unconfigured home.
+      - ./hermes-home:/opt/data
