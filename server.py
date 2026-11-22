@@ -201,12 +201,17 @@ def verdict_of(review):
     return "APPROVE" if "approve" in last else "REQUEST_CHANGES"
 
 
-def strip_inline(review):
+def strip_inline(review, posted=None):
     """Remove inline-comment sections from the summary; those lines are posted separately.
 
     A section is dropped when it is a severity heading (Critical/Warning/...) or the
     explicit `Inline Comments` block, or when all it held was `path:line` bullets.
     """
+    def kept(line):
+        """Drop a `path:line` bullet only when that finding was posted inline."""
+        match = re.match(r"[-*]\s*`([^:`]+):(\d+)`", line.strip())
+        return not match or (posted is not None and (match.group(1), int(match.group(2))) not in posted)
+
     blocks, current = [], {"heading": "", "lines": []}
     for line in (review or "").splitlines():
         if line.strip().startswith("#"):
@@ -215,24 +220,29 @@ def strip_inline(review):
         else:
             current["lines"].append(line)
     blocks.append(current)
-    kept = []
+    kept_blocks = []
     for block in blocks:
         heading = block["heading"]
-        lines = [l for l in block["lines"] if not re.match(r"[-*]\s*`[^:`]+:\d+`", l.strip())]
+        lines = [l for l in block["lines"] if kept(l)]
         body = "\n".join(lines).strip()
         drop_section = (SEVERITY_HEADING.search(heading) is not None
                         or "inline comments" in heading.lower()
                         or (heading and not body))
         if not drop_section and heading:
-            kept.append(heading)
+            kept_blocks.append(heading)
         if body:
-            kept.append(body)
-    return re.sub(r"(?im)^.*verdict:.*$\n?", "", "\n\n".join(kept)).strip()
+            kept_blocks.append(body)
+    return re.sub(r"(?im)^.*verdict:.*$\n?", "", "\n\n".join(kept_blocks)).strip()
 
 
-def review_body(review, author, verdict, marker=True):
-    """Wrap model output in the posted comment: header, summary, marker, footer."""
-    summary = strip_inline(review)
+def review_body(review, author, verdict, marker=True, posted=None):
+    """Wrap model output in the posted comment: header, summary, marker, footer.
+
+    `posted` is the set of (file, line) already posted inline; those findings are
+    omitted from the summary so nothing is duplicated — and nothing is lost when
+    the inline cap left some findings unposted.
+    """
+    summary = strip_inline(review, posted)
     mention = f"@{author}" if author else "there"
     header = (f"### \u2705 LGTM! {mention}, your changes are approved.\n\n" if verdict == "APPROVE"
               else f"### \U0001f534 Changes Requested \u2014 {mention}, please address the feedback below before merge.\n\n")
@@ -284,8 +294,9 @@ def gl_post_inline(base, token, path, review, changes, refs):
     for change in changes:
         file_path = change.get("new_path") or change.get("old_path", "")
         valid[file_path] = new_lines_of(change.get("diff"))
-    posted = 0
-    for comment in parse_inline_comments(review):
+    done = set()
+    comments = parse_inline_comments(review)
+    for comment in comments:
         if comment["line"] not in valid.get(comment["file"], set()):
             LOG.info("inline %s:%s not in diff, skipping", comment["file"], comment["line"])
             continue
@@ -299,8 +310,12 @@ def gl_post_inline(base, token, path, review, changes, refs):
                     "new_path": comment["file"], "new_line": comment["line"]}
         if "id" in api_json(base, token, "gitlab", path + "/discussions",
                             {"body": body, "position": position}):
-            posted += 1
-    return posted
+            done.add((comment["file"], comment["line"]))
+        if len(done) >= MAX_INLINE:
+            LOG.info("inline cap %s reached, %s finding(s) stay in the summary",
+                     MAX_INLINE, len(comments) - len(done))
+            break
+    return done
 
 
 def gl_approve(base, token, path, author):
@@ -465,18 +480,18 @@ def gh_can_approve(base, token, full_name):
 def gh_post_inline(base, token, full_name, number, review, files, author, event="COMMENT"):
     """Post parsed inline comments as one batched pull-request review with inline comments."""
     valid = {f["new_path"]: new_lines_of(f["diff"]) for f in files}
-    comments, skipped = [], 0
-    for comment in parse_inline_comments(review):
+    findings, comments = parse_inline_comments(review), []
+    for comment in findings:
         if comment["line"] not in valid.get(comment["file"], set()):
             LOG.info("inline %s:%s not in diff, skipping", comment["file"], comment["line"])
-            skipped += 1
             continue
         text = f"**{comment['level']}** {comment['message']}"
         if comment["fix"]:
             text += f"\n\n*Fix:* {comment['fix']}"
         comments.append({"path": comment["file"], "line": comment["line"], "side": "RIGHT", "body": text})
         if len(comments) >= MAX_INLINE:
-            skipped += 1
+            LOG.info("inline cap %s reached, %s finding(s) only in the summary",
+                     MAX_INLINE, len(findings) - len(comments))
             break
     if not comments:
         return 0
@@ -603,8 +618,8 @@ def process(platform, event, payload, config):
     if platform == "gitlab":
         inline = gl_post_inline(job["base"], job["token"], job["path"], review, job["files"], job["refs"])
         api(job["base"], job["token"], "gitlab", job["path"] + "/notes",
-            {"body": review_body(review, job["author"], verdict)})
-        LOG.info("MR reviewed: verdict=%s inline=%d access=%s", verdict, inline, job["level"])
+            {"body": review_body(review, job["author"], verdict, posted=inline)})
+        LOG.info("MR reviewed: verdict=%s inline=%d access=%s", verdict, len(inline), job["level"])
         if verdict == "APPROVE" and not draft and job["level"] >= APPROVE_ACCESS_LEVEL:
             LOG.info("MR approved: %s", gl_approve(job["base"], job["token"], job["path"], job["author"]))
     else:

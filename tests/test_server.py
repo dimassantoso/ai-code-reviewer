@@ -508,7 +508,7 @@ class InlineTests(unittest.TestCase):
         with patch.object(server, "api", side_effect=fake_api):
             posted = server.gl_post_inline("https://gl/api/v4", "t", "/projects/1/merge_requests/2",
                                            self.REVIEW, changes, {"base_sha": "b", "head_sha": "h"})
-        self.assertEqual(posted, 1)
+        self.assertEqual(posted, {("src/auth.py", 31)})
         self.assertEqual(calls[0][0], "/projects/1/merge_requests/2/discussions")
         self.assertEqual(calls[0][1]["position"]["new_line"], 31)
         self.assertEqual(calls[0][1]["position"]["position_type"], "text")
@@ -532,6 +532,25 @@ REAL_MODEL_REVIEW = """**Verdict:** \U0001f534 REQUEST_CHANGES
 ---
 \U0001f916 *Reviewed by AI Code Reviewer*
 """
+
+
+class SummaryCoverageTests(unittest.TestCase):
+    """Nothing may be lost when the inline cap or a bad line number drops a finding."""
+
+    def test_findings_skipped_inline_stay_in_summary(self):
+        review = ("### Critical\n- `a.py:1` kept inline.\n- `a.py:99` not in diff.\n"
+                  "### Warning\n- `b.py:2` also skipped.\n\nVERDICT: REQUEST_CHANGES")
+        posted = {("a.py", 1)}
+        body = server.review_body(review, "alice", "REQUEST_CHANGES", posted=posted)
+        self.assertNotIn("kept inline", body)
+        self.assertIn("a.py:99", body)
+        self.assertIn("b.py:2", body)
+
+    def test_all_posted_findings_removed_from_summary(self):
+        review = "### Critical\n- `a.py:1` one.\n\n### Notes\n- keep me\n\nVERDICT: APPROVE"
+        body = server.review_body(review, "alice", "APPROVE", posted={("a.py", 1)})
+        self.assertNotIn("a.py:1", body)
+        self.assertIn("keep me", body)
 
 
 class RealModelOutputTests(unittest.TestCase):
