@@ -176,13 +176,24 @@ class HandlerTests(unittest.TestCase):
 
 class ApiStub(BaseHTTPRequestHandler):
     notes = []
+    overflow = False
     diff = "--- a.py\n+print(1)\n"
 
     def do_GET(self):
         if self.path == "/api/v4/projects/1/merge_requests/2/changes?access_raw_diffs=true":
-            payload = {"changes": [{"new_path": "a.py", "diff": "+print(1)"}], "overflow": False}
+            payload = {"changes": [{"new_path": "a.py", "diff": "@@ -0,0 +1 @@\n+print(1)"}],
+                       "overflow": ApiStub.overflow}
+        elif self.path == "/api/v4/projects/1":
+            payload = {"id": 1, "permissions": {"project_access": {"access_level": 40}}}
+        elif self.path == "/api/v4/projects/1/merge_requests/2/notes?per_page=100&sort=desc":
+            payload = []
+        elif self.path == "/api/v4/projects/1/merge_requests/2/approvals":
+            payload = {"user_has_approved": False, "user_can_approve": True, "state": "pending"}
+        elif self.path == "/api/v4/projects/1/merge_requests/2/discussions?per_page=100":
+            payload = []
         elif self.path == "/api/v4/projects/1/merge_requests/2":
-            payload = {"iid": 2}
+            payload = {"iid": 2, "author": {"username": "alice"}, "diff_refs": {
+                "base_sha": "b" * 40, "start_sha": "s" * 40, "head_sha": "h" * 40}}
         else:
             self.send_response(404)
             self.end_headers()
@@ -267,7 +278,9 @@ class EndToEndTests(unittest.TestCase):
         path, posted, token = ApiStub.notes[0]
         self.assertEqual(path, "/api/v4/projects/1/merge_requests/2/notes")
         self.assertEqual(token, "gl-token")
-        self.assertIn("VERDICT: APPROVE", posted["body"])
+        self.assertIn("<!-- ai-review -->", posted["body"])
+        self.assertIn("Approved", posted["body"])
+        self.assertNotIn("VERDICT:", posted["body"])
         with open(self.hermes + ".stdin") as handle:
             prompt = handle.read()
         self.assertIn("+print(1)", prompt)
@@ -333,12 +346,166 @@ class GitLabFlowTests(unittest.TestCase):
     CONFIG = {"token": "gl", "secret": SECRET, "url": "https://gitlab.example.com"}
 
     def test_overflow_blocks_review(self):
-        changes = b'{"changes": [], "overflow": true}'
-        with patch.object(server, "api", return_value=changes), patch.object(server, "run_hermes") as hermes:
+        def fake_api(base, token, platform, path, body=None, accept="application/json"):
+            if path == "/projects/1":
+                return json.dumps({"permissions": {"project_access": {"access_level": 40}}}).encode()
+            return b'{"changes": [], "overflow": true}'
+
+        with patch.object(server, "api", side_effect=fake_api), patch.object(server, "run_hermes") as hermes:
             with self.assertRaises(ValueError):
                 server.process("gitlab", "Merge Request Hook", {
                     "object_kind": "merge_request", "project": {"id": 1},
                     "object_attributes": {"iid": 2, "action": "update"}}, self.CONFIG)
+        hermes.assert_not_called()
+
+    def test_low_access_level_skips_review(self):
+        def fake_api(base, token, platform, path, body=None, accept="application/json"):
+            return b'{"permissions": {"project_access": {"access_level": 20}}}'
+
+        with patch.object(server, "api", side_effect=fake_api), patch.object(server, "run_hermes") as hermes:
+            self.assertFalse(server.process("gitlab", "Merge Request Hook", {
+                "object_kind": "merge_request", "project": {"id": 1},
+                "object_attributes": {"iid": 2, "action": "update"}}, self.CONFIG))
+        hermes.assert_not_called()
+
+
+class InlineTests(unittest.TestCase):
+    REVIEW = ("Summary here.\n\n### Inline Comments\n"
+              "- `src/auth.py:31` WARNING: Off-by-one expiry check. Fix: use <.\n"
+              "- `src/db.py:12` SUGGESTION: Reuse the connection pool.\n"
+              "- not a comment line\n\nVERDICT: REQUEST_CHANGES")
+
+    def test_parses_comments(self):
+        parsed = server.parse_inline_comments(self.REVIEW)
+        self.assertEqual([(c["file"], c["line"], c["level"]) for c in parsed],
+                         [("src/auth.py", 31, "WARNING"), ("src/db.py", 12, "SUGGESTION")])
+        self.assertEqual(parsed[0]["fix"], "use <")
+
+    def test_new_lines_match_diff_hunks(self):
+        diff = "@@ -1,2 +1,3 @@\n context\n+added\n-removed\n+another\n"
+        self.assertEqual(server.new_lines_of(diff), {2, 3})
+
+    def test_verdict_parsing(self):
+        self.assertEqual(server.verdict_of("looks fine\nVERDICT: APPROVE"), "APPROVE")
+        self.assertEqual(server.verdict_of("nol\nVERDICT: REQUEST_CHANGES"), "REQUEST_CHANGES")
+        self.assertEqual(server.verdict_of("VERDICT: APPROVE but REQUEST_CHANGES"), "REQUEST_CHANGES")
+        self.assertEqual(server.verdict_of("no verdict at all"), "REQUEST_CHANGES")
+
+    def test_review_body_strips_inline_and_verdict(self):
+        body = server.review_body(self.REVIEW, "alice", "REQUEST_CHANGES")
+        self.assertIn("<!-- ai-review -->", body)
+        self.assertIn("@alice", body)
+        self.assertIn("Summary here.", body)
+        self.assertNotIn("### Inline Comments", body)
+        self.assertNotIn("VERDICT:", body)
+
+    def test_inline_posted_only_for_real_lines(self):
+        calls = []
+
+        def fake_api(base, token, platform, path, body=None, accept="application/json"):
+            calls.append((path, body))
+            return b'{"id": 9}'
+
+        changes = [{"new_path": "src/auth.py", "diff": "@@ -28,4 +30,4 @@\n a\n+b\n"}]
+        with patch.object(server, "api", side_effect=fake_api):
+            posted = server.gl_post_inline("https://gl/api/v4", "t", "/projects/1/merge_requests/2",
+                                           self.REVIEW, changes, {"base_sha": "b", "head_sha": "h"})
+        self.assertEqual(posted, 1)
+        self.assertEqual(calls[0][0], "/projects/1/merge_requests/2/discussions")
+        self.assertEqual(calls[0][1]["position"]["new_line"], 31)
+        self.assertEqual(calls[0][1]["position"]["position_type"], "text")
+
+
+class DebateTests(unittest.TestCase):
+    def setUp(self):
+        self.saved = dict(os.environ)
+        server._replied.clear()
+        server._cooldown.clear()
+        self.saved_bot = server.BOT_USERNAME
+        self.saved_min = server.MIN_ACCESS_LEVEL
+        server.BOT_USERNAME = "santosodb"
+        server.MIN_ACCESS_LEVEL = 30
+        self.config = {"token": "gl", "secret": SECRET, "url": "https://gitlab.example.com"}
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self.saved)
+        server.BOT_USERNAME = self.saved_bot
+        server.MIN_ACCESS_LEVEL = self.saved_min
+        with server._replied_lock:
+            server._replied.clear()
+        with server._cooldown_lock:
+            server._cooldown.clear()
+
+    def payload(self, note="@santosodb is this a real bug?", discussion_id="d1", note_id=7,
+                username="alice", marker=False):
+        return {"object_kind": "note", "project_id": 1,
+                "user": {"username": username},
+                "object_attributes": {"note": ("<!-- ai-review -->" if marker else "") + note,
+                                      "noteable_type": "MergeRequest", "noteable_iid": 2,
+                                      "discussion_id": discussion_id, "id": note_id}}
+
+    def fake_api(self, posts, level=40):
+        def call(base, token, platform, path, body=None, accept="application/json"):
+            if body is None:
+                if path == "/projects/1":
+                    return json.dumps({"permissions": {"project_access": {"access_level": level}}}).encode()
+                if path.startswith("/projects/1/merge_requests/2/discussions"):
+                    return json.dumps([{"id": "d1", "notes": [
+                        {"author": {"username": "santosodb"}, "body": "That expiry check is wrong."},
+                        {"author": {"username": "alice"}, "body": "Why?"}]}]).encode()
+                return b"{}"
+            posts.append((path, body))
+            return b'{"id": 5}'
+        return call
+
+    def test_mention_triggers_threaded_reply(self):
+        posts = []
+        with patch.object(server, "api", side_effect=self.fake_api(posts)), \
+             patch.object(server, "run_hermes", return_value="You're right \u2014 the check should be <."):
+            self.assertTrue(server.debate("gitlab", self.payload(), self.config))
+        self.assertEqual(posts[0][0], "/projects/1/merge_requests/2/discussions/d1/notes")
+        self.assertIn("<!-- ai-review -->", posts[0][1]["body"])
+        self.assertIn("Reply to @alice", posts[0][1]["body"])
+
+    def test_own_marker_and_non_mention_ignored(self):
+        with patch.object(server, "run_hermes") as hermes:
+            self.assertFalse(server.debate("gitlab", self.payload(marker=True), self.config))
+            self.assertFalse(server.debate("gitlab", self.payload(note="no mention here"), self.config))
+            self.assertFalse(server.debate("gitlab", self.payload(username="santosodb"), self.config))
+        hermes.assert_not_called()
+
+    def test_substring_mention_rejected(self):
+        with patch.object(server, "run_hermes") as hermes:
+            self.assertFalse(server.debate("gitlab", self.payload(note="@santosodbot ping"), self.config))
+        hermes.assert_not_called()
+
+    def test_same_note_replied_once(self):
+        posts = []
+        with patch.object(server, "api", side_effect=self.fake_api(posts)), \
+             patch.object(server, "run_hermes", return_value="ok"):
+            self.assertTrue(server.debate("gitlab", self.payload(), self.config))
+            self.assertFalse(server.debate("gitlab", self.payload(), self.config))
+        self.assertEqual(len(posts), 1)
+
+    def test_cooldown_blocks_second_note_same_thread(self):
+        posts = []
+        with patch.object(server, "api", side_effect=self.fake_api(posts)), \
+             patch.object(server, "run_hermes", return_value="ok"):
+            self.assertTrue(server.debate("gitlab", self.payload(note_id=7), self.config))
+            self.assertFalse(server.debate("gitlab", self.payload(note_id=8), self.config))
+        self.assertEqual(len(posts), 1)
+
+    def test_low_access_blocks_debate(self):
+        with patch.object(server, "api", side_effect=self.fake_api([], level=20)), \
+             patch.object(server, "run_hermes") as hermes:
+            self.assertFalse(server.debate("gitlab", self.payload(), self.config))
+        hermes.assert_not_called()
+
+    def test_no_bot_username_disables_debate(self):
+        server.BOT_USERNAME = ""
+        with patch.object(server, "run_hermes") as hermes:
+            self.assertFalse(server.debate("gitlab", self.payload(), self.config))
         hermes.assert_not_called()
 
 

@@ -47,6 +47,10 @@ Copy `.env.example` to `.env` and fill in at least one platform token and its we
 | `HERMES_TIMEOUT_S` | CLI timeout in seconds; default `300`. |
 | `MAX_WORKERS` | Concurrent reviews; each one runs a `hermes` subprocess. Default `4`. |
 | `QUEUE_SIZE` | Pending reviews held before new webhooks get `503`. Default `100`. |
+| `BOT_USERNAME` | GitLab username to answer `@mention` debates. Blank disables debate replies. |
+| `MIN_ACCESS_LEVEL` | GitLab access level required to review/reply. Default `30` (Developer). |
+| `APPROVE_ACCESS_LEVEL` | Access level required for auto-approve. Default `40` (Maintainer). |
+| `COOLDOWN_SECONDS` | Per-user per-thread debate cooldown. Default `30`. |
 
 The server reads environment variables, not `.env` itself. Docker Compose loads `.env` via `env_file`; direct Python users must export it. Use shell-compatible values if sourcing the file.
 
@@ -100,7 +104,9 @@ Compose publishes only `127.0.0.1:9877` and forces the container listener to `0.
 - GitHub: configure `https://<host>/gh-review` for pull request events and JSON payloads. The server verifies `X-Hub-Signature-256`.
 - `GET /health` returns `200 ok`. A disabled platform returns `404`; an invalid signature returns `403`.
 - Valid requests are acknowledged with `202 accepted` before background processing. This is not proof a review was posted; inspect logs and the MR/PR. Duplicate payloads are suppressed in memory for five minutes, not durably across restarts.
-- GitLab open/update/reopen and GitHub opened/synchronize/reopened events trigger review. GitLab gets a note; GitHub gets a comment review. No automatic approval or merge is performed. Thread debate, access-level filtering and persistent deduplication are not implemented.
+- GitLab open/update/reopen and GitHub opened/synchronize/reopened events trigger review. GitLab gets inline discussions (only for lines present in the diff) plus a summary note; GitHub gets one `COMMENT` review.
+- Auto-approve on GitLab only: verdict `APPROVE`, access ≥ `APPROVE_ACCESS_LEVEL`, author is not the bot, token user has not approved, and `user_can_approve` is not false.
+- Debate: a GitLab note or GitHub comment that `@BOT_USERNAME` and is not our own reply gets an in-thread answer. Per-note dedupe, per-thread cooldown (`COOLDOWN_SECONDS`), and a bounded transcript of that discussion; GitLab additionally requires `MIN_ACCESS_LEVEL`. Bot and `[bot]` authors are ignored. Blank `BOT_USERNAME` disables it.
 - Diffs over 100,000 characters are rejected rather than silently truncated. API and Hermes errors are logged; retries and persistence are not guaranteed after acknowledgement.
 
 Review input is untrusted. The service requests empty Hermes toolsets and strips platform credentials from the CLI child environment, but use a dedicated least-privilege account and review model output before acting on it.

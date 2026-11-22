@@ -46,10 +46,12 @@ Secrets are mandatory — no dev bypass.
 ## Review flow
 
 1. Verify signature, dedupe identical raw payloads in memory (5 min), reply `202`.
-2. Fetch the diff (GitLab: `/projects/:id/merge_requests/:iid/changes`; GitHub: `Accept: application/vnd.github.v3.diff`).
+2. Review path: GitLab access gate (`MIN_ACCESS_LEVEL`), skip if already reviewed on `open`, fetch diff.
 3. Cap diff at 100 KB — larger is rejected, never silently truncated.
 4. Shell out to `hermes chat --query-file - -t "" -Q --max-turns 5`, with platform tokens stripped from the child env.
-5. Post the result: GitLab MR note, GitHub `COMMENT` review.
+5. GitLab: post each inline comment that lands on a real new-side diff line, then the summary note. Approve when verdict is `APPROVE` and access ≥ `APPROVE_ACCESS_LEVEL`. GitHub: one `COMMENT` review.
+
+Debate path (comment event with `@BOT_USERNAME`): dedupe per note, per-thread cooldown, access gate, then reply inside the same thread using a bounded transcript of that discussion.
 
 Reviews run in a fixed worker pool (`MAX_WORKERS`, default 4); webhooks queue up to `QUEUE_SIZE` (default 100) then get `503`. Same-MR events are serialized by a per-target lock, so a stale review cannot land after a newer one. Duplicate payloads are claimed under a lock before dispatch; a failed review releases its claim so the platform retry still runs.
 
@@ -57,10 +59,8 @@ No approval, merge, or code change. No thread-debate replies, access-level gatin
 
 ## Not implemented
 
-- Reply to `@mention` debates.
-- Access-level / permission checks (`MIN_ACCESS_LEVEL`, `GITHUB_MIN_PERMISSION`).
-- Inline diff-line comments; review text is posted as one note.
 - Durable dedupe or retry: an accepted job is lost if the process dies.
+- GitHub inline per-line comments (GitLab inline works).
 
 Add these when a real user asks; each is a separate feature, listed so behaviour is not over-claimed.
 
