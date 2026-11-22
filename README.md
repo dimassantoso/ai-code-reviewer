@@ -45,6 +45,8 @@ Copy `.env.example` to `.env` and fill in at least one platform token and its we
 | `HERMES_MODEL` | Optional model override; otherwise use Hermes configuration. |
 | `HERMES_SKILL` | Optional skill name; example sets `ai-code-reviewer`. |
 | `HERMES_TIMEOUT_S` | CLI timeout in seconds; default `300`. |
+| `MAX_WORKERS` | Concurrent reviews; each one runs a `hermes` subprocess. Default `4`. |
+| `QUEUE_SIZE` | Pending reviews held before new webhooks get `503`. Default `100`. |
 
 The server reads environment variables, not `.env` itself. Docker Compose loads `.env` via `env_file`; direct Python users must export it. Use shell-compatible values if sourcing the file.
 
@@ -106,7 +108,20 @@ Review input is untrusted. The service requests empty Hermes toolsets and strips
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s tests -v   # 38 tests: units, end-to-end, concurrency races
+python3 tests/loadtest.py --requests 200 --concurrency 32 --workers 4
 ```
 
 Tests use mocks and do not prove platform credentials, network access or model readiness.
+
+## Concurrency and limits
+
+- Reviews run in a fixed worker pool (`MAX_WORKERS`); webhooks queue up to `QUEUE_SIZE` then get `503` so the platform retries. Ack is immediate (`202`) — a full queue is the only throttle.
+- Two events for the same MR/PR are serialized by a per-target lock, so an older diff cannot post its review after a newer one.
+- Duplicate payloads are claimed under a lock before dispatch: 16 parallel copies of one delivery produce exactly one review.
+- A failed review releases its claim, so the platform's retry is not swallowed by dedupe.
+- Accept backlog is 128 (stdlib default 5 drops connections under a burst).
+
+Measured on an ARM SBC (4×A55, Python 3.13, stub review of 50 ms): ~43 webhook req/s ack throughput, p50 37 ms at concurrency 1; `/health` ceiling ~170 req/s. Real throughput is bounded by `MAX_WORKERS / review_latency`, not by the HTTP layer — a 20 s model review with 4 workers means ~0.2 reviews/s.
+
+`tests/loadtest.py` verifies the pool never exceeds `MAX_WORKERS` and reports statuses, throughput and latency percentiles.

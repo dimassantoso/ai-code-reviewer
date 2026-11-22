@@ -7,6 +7,7 @@ import hmac
 import json
 import logging
 import os
+import queue
 import re
 import subprocess
 import threading
@@ -130,6 +131,73 @@ def process(platform, event, payload, config):
 _seen = {}
 _seen_lock = threading.Lock()
 
+# Bounded review concurrency: each review spawns a `hermes` subprocess, so an
+# unbounded thread-per-webhook lets a burst exhaust memory/processes. Jobs go to
+# a fixed worker pool; a full queue answers 503 so the platform retries later.
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))
+_jobs = queue.Queue(maxsize=int(os.getenv("QUEUE_SIZE", "100")))
+_workers_lock = threading.Lock()
+_workers_started = False
+_targets = {}
+_targets_lock = threading.Lock()
+
+
+def start_workers(count=None):
+    """Start the review worker pool once. Lazy so tests and imports stay cheap."""
+    global _workers_started
+    with _workers_lock:
+        if _workers_started:
+            return
+        _workers_started = True
+        for _ in range(count or MAX_WORKERS):
+            spawn(worker, ())
+
+
+def worker():
+    while True:
+        job = _jobs.get()
+        try:
+            run_job(*job)
+        finally:
+            _jobs.task_done()
+
+
+def run_job(platform, event, payload, cfg, raw, key):
+    try:
+        with target_lock(key):
+            LOG.info("%s review: %s", platform, "posted" if process(platform, event, payload, cfg) else "ignored")
+    except (ValueError, TypeError, UnicodeError) as error:
+        LOG.warning("%s review rejected: %s", platform, error)
+        release(platform, raw)
+    except (OSError, URLError, subprocess.SubprocessError):
+        LOG.exception("%s review failed", platform)
+        release(platform, raw)  # allow the platform's retry to run again
+
+
+def target_lock(key):
+    """Serialize reviews of the same MR/PR so a stale review cannot land last."""
+    if key is None:
+        return threading.Lock()  # unkeyed: no cross-request ordering to enforce
+    with _targets_lock:
+        if len(_targets) > 1000:  # ponytail: unbounded map; add LRU if MR count explodes
+            _targets.clear()
+        return _targets.setdefault(key, threading.Lock())
+
+
+def spawn(target, args):
+    """Start a daemon worker thread. Separate so tests can force thread failure."""
+    thread = threading.Thread(target=target, args=args, daemon=True)
+    thread.start()
+
+
+def target_of(platform, payload):
+    try:
+        if platform == "gitlab":
+            return ("gitlab", payload["project"]["id"], payload["object_attributes"]["iid"])
+        return ("github", payload["repository"]["full_name"], payload["number"])
+    except (KeyError, TypeError, AttributeError):
+        return None
+
 
 def claim(platform, raw):
     """Reject duplicate payloads for five minutes within this process."""
@@ -165,15 +233,6 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.respond(200, "ok") if self.path == "/health" else self.respond(404, "not found")
 
-    def review(self, platform, event, payload, cfg, raw):
-        try:
-            LOG.info("%s review: %s", platform, "posted" if process(platform, event, payload, cfg) else "ignored")
-        except (ValueError, TypeError, UnicodeError) as error:
-            LOG.warning("%s review rejected: %s", platform, error)
-        except (OSError, URLError, subprocess.SubprocessError):
-            LOG.exception("%s review failed", platform)
-            release(platform, raw)  # allow the platform's retry to run again
-
     def do_POST(self):
         platform = {"/gl-review": "gitlab", "/gh-review": "github"}.get(self.path)
         if not platform or platform not in self.server.config:
@@ -197,7 +256,12 @@ class Handler(BaseHTTPRequestHandler):
             if not claim(platform, raw):
                 return self.respond(200, "duplicate")
             # Ack before the slow review: GitLab/GitHub time out webhooks at 10s.
-            threading.Thread(target=self.review, args=(platform, event, payload, cfg, raw), daemon=True).start()
+            try:
+                start_workers()
+                _jobs.put_nowait((platform, event, payload, cfg, raw, target_of(platform, payload)))
+            except (queue.Full, RuntimeError):  # pool full or workers cannot start
+                release(platform, raw)
+                return self.respond(503, "busy")
             self.respond(202, "accepted")
         except OverflowError:
             self.respond(503, "busy")
@@ -238,6 +302,13 @@ def load_config():
     return configs
 
 
+class Server(ThreadingHTTPServer):
+    """Raise the accept backlog: default 5 resets connections during a webhook burst."""
+
+    request_queue_size = 128
+    daemon_threads = True
+
+
 def main():
     logging.basicConfig(level=logging.INFO)
     config = load_config()
@@ -246,7 +317,7 @@ def main():
     started = []
     try:
         for port in ports:
-            server = ThreadingHTTPServer((os.getenv("BIND_HOST", "0.0.0.0"), port), Handler)
+            server = Server((os.getenv("BIND_HOST", "0.0.0.0"), port), Handler)
             server.config = config
             servers.append(server)
         for server in servers:

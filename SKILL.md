@@ -51,6 +51,8 @@ Secrets are mandatory — no dev bypass.
 4. Shell out to `hermes chat --query-file - -t "" -Q --max-turns 5`, with platform tokens stripped from the child env.
 5. Post the result: GitLab MR note, GitHub `COMMENT` review.
 
+Reviews run in a fixed worker pool (`MAX_WORKERS`, default 4); webhooks queue up to `QUEUE_SIZE` (default 100) then get `503`. Same-MR events are serialized by a per-target lock, so a stale review cannot land after a newer one. Duplicate payloads are claimed under a lock before dispatch; a failed review releases its claim so the platform retry still runs.
+
 No approval, merge, or code change. No thread-debate replies, access-level gating, or persistent queue — see "Not implemented".
 
 ## Not implemented

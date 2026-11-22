@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import queue
 import sys
 import tempfile
 import threading
@@ -12,6 +13,7 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -404,6 +406,125 @@ class HermesTests(unittest.TestCase):
         os.environ["HERMES_TIMEOUT_S"] = "1"
         with self.assertRaises(Exception):
             server.run_hermes("diff")
+
+
+class ConcurrencyTests(unittest.TestCase):
+    """Race conditions: dedupe under parallel delivery, per-MR ordering, queue bounds."""
+
+    def setUp(self):
+        server._seen.clear()
+        server._targets.clear()
+        server._jobs = queue.Queue(maxsize=100)
+        server._workers_started = False
+        self.config = {"github": {"token": "t", "secret": SECRET, "url": "https://api.github.com"}}
+        self.httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        self.httpd.config = self.config
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        server._workers_started = False
+
+    def post(self, raw):
+        headers = {"X-Hub-Signature-256": sign_github(raw), "X-GitHub-Event": "pull_request"}
+        request = Request(self.base + "/gh-review", data=raw, headers=headers, method="POST")
+        try:
+            with urlopen(request, timeout=10) as response:
+                return response.status
+        except HTTPError as error:
+            return error.code
+
+    def payload(self, number=1, head="a"):
+        return json.dumps({"action": "opened", "number": number,
+                           "repository": {"full_name": "o/r"}, "after": head}).encode()
+
+    def test_parallel_duplicate_delivery_reviews_once(self):
+        raw = self.payload(head="dup")
+        calls = []
+        gate = threading.Event()
+
+        def fake_process(*args):
+            calls.append(args[0])
+            gate.wait(5)
+            return True
+
+        with patch.object(server, "process", side_effect=fake_process):
+            results = []
+            threads = [threading.Thread(target=lambda: results.append(self.post(raw))) for _ in range(16)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(10)
+            gate.set()
+            deadline = time.time() + 5
+            while len(calls) < 1 and time.time() < deadline:
+                time.sleep(0.02)
+            time.sleep(0.3)
+
+        self.assertEqual(len(calls), 1, "identical payload reviewed more than once")
+        self.assertEqual(results.count(202), 1)
+        self.assertEqual(results.count(200), 15)
+
+    def test_same_mr_reviews_are_serialized(self):
+        active = []
+        peak = []
+        done = []
+
+        def fake_process(*args):
+            active.append(1)
+            peak.append(len(active))
+            time.sleep(0.2)
+            active.pop()
+            done.append(1)
+            return True
+
+        with patch.object(server, "process", side_effect=fake_process):
+            for i in range(3):
+                self.assertEqual(self.post(self.payload(head="h%d" % i)), 202)
+            deadline = time.time() + 10
+            while time.time() < deadline and len(done) < 3:
+                time.sleep(0.02)
+
+        self.assertEqual(len(done), 3)
+        self.assertEqual(max(peak), 1, "two reviews of one MR ran concurrently")
+
+    def test_full_queue_returns_503_then_retry_succeeds(self):
+        server._jobs = queue.Queue(maxsize=1)
+        self.addCleanup(setattr, server, "MAX_WORKERS", server.MAX_WORKERS)
+        server.MAX_WORKERS = 1
+        gate = threading.Event()
+
+        def fake_process(*args):
+            gate.wait(10)
+            return True
+
+        with patch.object(server, "process", side_effect=fake_process):
+            self.assertEqual(self.post(self.payload(number=1)), 202)   # worker picks it up
+            self.assertEqual(self.post(self.payload(number=2)), 202)   # fills the queue
+            self.assertEqual(self.post(self.payload(number=3)), 503)   # queue full
+            gate.set()
+            time.sleep(0.4)
+            with patch.object(server, "process", return_value=True):
+                self.assertEqual(self.post(self.payload(number=3)), 202)
+
+    def test_worker_start_failure_releases_claim(self):
+        raw = self.payload(number=9)
+        with patch.object(server, "spawn", side_effect=RuntimeError("no threads")):
+            self.assertEqual(self.post(raw), 503)
+        with patch.object(server, "process", return_value=True):
+            self.assertEqual(self.post(raw), 202)
+
+    def test_failed_review_releases_claim_for_platform_retry(self):
+        raw = self.payload(number=7)
+        with patch.object(server, "process", side_effect=OSError("api down")):
+            self.assertEqual(self.post(raw), 202)
+            key = ("github", hashlib.sha256(raw).digest())
+            deadline = time.time() + 5
+            while time.time() < deadline and key in server._seen:
+                time.sleep(0.02)
+            self.assertNotIn(key, server._seen, "failed review kept the dedupe claim")
 
 
 if __name__ == "__main__":
