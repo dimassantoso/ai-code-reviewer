@@ -116,26 +116,44 @@ def bot_mentioned(text):
     return bool(BOT_USERNAME and re.search(rf"(?<![\w-])@{re.escape(BOT_USERNAME)}(?![\w-])", text, re.I))
 
 
+SEVERITY_HEADING = re.compile(r"(?i)\b(critical|warning|suggestion|nit)\b")
+LEVELS = {"CRITICAL": "CRITICAL", "WARNING": "WARNING", "SUGGESTION": "SUGGESTION", "NIT": "SUGGESTION"}
+
+
 def parse_inline_comments(review_text):
-    """Parse the '### Inline Comments' block into [{file, line, level, message, fix}]."""
-    comments, in_section = [], False
-    for line in review_text.splitlines():
+    """Collect `path:line` bullets with their severity, from either supported review layout.
+
+    Accepts the explicit `### Inline Comments` block (`- `f.py:3` WARNING: msg. Fix: x`)
+    and the sectioned layout models actually produce (`### Critical` then `- `f.py:3` msg`).
+    """
+    comments, level = [], None
+    for line in (review_text or "").splitlines():
         stripped = line.strip()
-        if stripped.startswith("### Inline Comments"):
-            in_section = True
+        if stripped.startswith("#"):
+            match = SEVERITY_HEADING.search(stripped)
+            level = LEVELS.get(match.group(1).upper()) if match else None
             continue
-        if in_section and stripped.startswith("### "):
-            break
-        if in_section and stripped.startswith("-"):
-            match = re.match(r"-\s*`([^:`]+):(\d+)`\s+(\w+):\s*(.+)$", stripped)
-            if match:
-                path, number, level, text = match.groups()
-                message, fix = text, ""
-                split = re.match(r"(.*?)\.\s*Fix:\s*(.+)$", text)
-                if split:
-                    message, fix = split.group(1) + ".", split.group(2)
-                comments.append({"file": path.strip(), "line": int(number), "level": level.upper(),
-                                 "message": message.strip(), "fix": fix.strip().rstrip(".")})
+        if not stripped.startswith(("-", "*")):
+            continue
+        match = re.match(r"[-*]\s*`([^:`]+):(\d+)`\s*[\u2014\u2013-]?\s*(.*)$", stripped)
+        if not match:
+            continue
+        path, number, text = match.groups()
+        inline_level = re.match(r"\**\s*(CRITICAL|WARNING|SUGGESTION|NIT)\b\**:?\s*", text, re.I)
+        if inline_level:
+            level_name = LEVELS[inline_level.group(1).upper()]
+            text = text[inline_level.end():]
+        else:
+            level_name = level
+        if not level_name:
+            continue
+        message, fix = text, ""
+        split = re.match(r"(.*?)[.;]?\s*\*{0,2}Fix:?\*{0,2}\s*(.+)$", text)
+        if split:
+            message, fix = split.group(1) + ".", split.group(2)
+        comments.append({"file": path.strip(), "line": int(number), "level": level_name,
+                         "message": message.strip().strip("*").strip(),
+                         "fix": fix.strip().strip("*").rstrip(".")})
     return comments
 
 
@@ -159,17 +177,52 @@ def new_lines_of(diff):
 
 
 def verdict_of(review):
-    """Last verdict line wins; quoting the opposite word on it fails safe."""
-    lines = [l for l in (review or "").splitlines() if "VERDICT:" in l]
+    """Last verdict line wins, so prose quoting the opposite verdict cannot invert it.
+
+    Models emit `VERDICT: APPROVE`, `**Verdict:** ✅ APPROVE`, or `🔴 REQUEST_CHANGES`;
+    anything unreadable fails safe to REQUEST_CHANGES (never auto-approves).
+    """
+    lines = [l for l in (review or "").splitlines() if "verdict" in l.lower()]
     if not lines:
         return "REQUEST_CHANGES"
-    return "REQUEST_CHANGES" if "REQUEST_CHANGES" in lines[-1] else "APPROVE"
+    last = lines[-1].lower()
+    if "request_changes" in last or "changes requested" in last or "request changes" in last:
+        return "REQUEST_CHANGES"
+    return "APPROVE" if "approve" in last else "REQUEST_CHANGES"
+
+
+def strip_inline(review):
+    """Remove inline-comment sections from the summary; those lines are posted separately.
+
+    A section is dropped when it is a severity heading (Critical/Warning/...) or the
+    explicit `Inline Comments` block, or when all it held was `path:line` bullets.
+    """
+    blocks, current = [], {"heading": "", "lines": []}
+    for line in (review or "").splitlines():
+        if line.strip().startswith("#"):
+            blocks.append(current)
+            current = {"heading": line, "lines": []}
+        else:
+            current["lines"].append(line)
+    blocks.append(current)
+    kept = []
+    for block in blocks:
+        heading = block["heading"]
+        lines = [l for l in block["lines"] if not re.match(r"[-*]\s*`[^:`]+:\d+`", l.strip())]
+        body = "\n".join(lines).strip()
+        drop_section = (SEVERITY_HEADING.search(heading) is not None
+                        or "inline comments" in heading.lower()
+                        or (heading and not body))
+        if not drop_section and heading:
+            kept.append(heading)
+        if body:
+            kept.append(body)
+    return re.sub(r"(?im)^.*verdict:.*$\n?", "", "\n\n".join(kept)).strip()
 
 
 def review_body(review, author, verdict, marker=True):
     """Wrap model output in the posted comment: header, summary, marker, footer."""
-    summary = re.sub(r"(?ms)^### Inline Comments\n.*?(?=^##|^###|^---|\Z)", "", review)
-    summary = re.sub(r"(?m)^\s*VERDICT:.*$", "", summary).strip()
+    summary = strip_inline(review)
     mention = f"@{author}" if author else "there"
     header = (f"### \u2705 LGTM! {mention}, your changes are approved.\n\n" if verdict == "APPROVE"
               else f"### \U0001f534 Changes Requested \u2014 {mention}, please address the feedback below before merge.\n\n")
@@ -205,7 +258,10 @@ def gl_access_level(base, token, pid):
     level = max((perms.get("project_access") or {}).get("access_level", 0),
                 (perms.get("group_access") or {}).get("access_level", 0))
     if BOT_USERNAME:
-        members = api_json(base, token, "gitlab", f"/projects/{pid}/members/all?query={BOT_USERNAME}")
+        try:  # membership lookup is a bonus; a 403/404 here must not block the review
+            members = api_json(base, token, "gitlab", f"/projects/{pid}/members/all?query={BOT_USERNAME}")
+        except (OSError, URLError, ValueError):
+            members = None
         if isinstance(members, list):
             level = max([level] + [m.get("access_level", 0) for m in members
                                    if m.get("username") == BOT_USERNAME])

@@ -19,6 +19,11 @@ from urllib.request import Request, urlopen
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import server  # noqa: E402
 
+# Ambient env must not change results: these three are module-level constants.
+server.BOT_USERNAME = ""
+server.MIN_ACCESS_LEVEL = 30
+server.APPROVE_ACCESS_LEVEL = 40
+
 SECRET = "s3cret"
 
 
@@ -507,6 +512,54 @@ class InlineTests(unittest.TestCase):
         self.assertEqual(calls[0][0], "/projects/1/merge_requests/2/discussions")
         self.assertEqual(calls[0][1]["position"]["new_line"], 31)
         self.assertEqual(calls[0][1]["position"]["position_type"], "text")
+
+
+REAL_MODEL_REVIEW = """**Verdict:** \U0001f534 REQUEST_CHANGES
+
+### Criteria Checklist
+- [x] Security \u2014 fails, token unused
+
+### \U0001f534 Critical
+- `auth.py:2` \u2014 `time` used without import; function cannot execute. *Fix:* add `import time`.
+- `auth.py:1` \u2014 `token` never validated. *Fix:* validate it.
+
+### \u26a0\ufe0f Warning
+- `auth.py:2` \u2014 unvalidated `expiry`. *Fix:* normalize to epoch float.
+
+### \u2705 Looks Good
+- Nothing to commend.
+
+---
+\U0001f916 *Reviewed by AI Code Reviewer*
+"""
+
+
+class RealModelOutputTests(unittest.TestCase):
+    """Parsers must handle the layouts models actually emit, not only the prompted one."""
+
+    def test_sectioned_bullets_parsed_with_severity(self):
+        parsed = server.parse_inline_comments(REAL_MODEL_REVIEW)
+        self.assertEqual([(c["file"], c["line"], c["level"]) for c in parsed],
+                         [("auth.py", 2, "CRITICAL"), ("auth.py", 1, "CRITICAL"), ("auth.py", 2, "WARNING")])
+        self.assertIn("cannot execute", parsed[0]["message"])
+        self.assertEqual(parsed[0]["fix"], "add `import time`")
+
+    def test_bullets_without_severity_heading_ignored(self):
+        review = "### Notes\n- `a.py:3` just prose here\n### Critical\n- `a.py:4` real bug\n"
+        self.assertEqual([(c["line"], c["level"]) for c in server.parse_inline_comments(review)], [(4, "CRITICAL")])
+
+    def test_bold_verdict_line(self):
+        self.assertEqual(server.verdict_of(REAL_MODEL_REVIEW), "REQUEST_CHANGES")
+        self.assertEqual(server.verdict_of("**Verdict:** \u2705 APPROVE"), "APPROVE")
+        self.assertEqual(server.verdict_of("VERDICT: APPROVE"), "APPROVE")
+
+    def test_review_body_strips_sectioned_inline_blocks(self):
+        body = server.review_body(REAL_MODEL_REVIEW, "alice", "REQUEST_CHANGES")
+        self.assertIn("Changes Requested", body)
+        self.assertIn("@alice", body)
+        self.assertIn("Criteria Checklist", body)
+        self.assertNotIn("auth.py:2", body)
+        self.assertNotIn("Verdict:**", body)
 
 
 class DebateTests(unittest.TestCase):
