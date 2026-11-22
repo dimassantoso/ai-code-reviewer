@@ -27,6 +27,7 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "")
 MIN_ACCESS_LEVEL = int(os.getenv("MIN_ACCESS_LEVEL", "30"))      # 30=Developer
 APPROVE_ACCESS_LEVEL = int(os.getenv("APPROVE_ACCESS_LEVEL", "40"))  # 40=Maintainer
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "30"))
+MAX_DEBATE_DIFF = 20_000  # diff context handed to a debate reply
 MAX_INLINE = int(os.getenv("MAX_INLINE", "20"))  # inline comments posted per review
 
 REVIEW_FORMAT = (
@@ -335,6 +336,20 @@ def gl_thread(base, token, pid, iid, discussion_id):
     return "\n".join(lines)[-8000:]
 
 
+def bounded_diff(platform, base, token, target):
+    """Diff of the discussed change, truncated: a debate without code is guesswork."""
+    try:
+        if platform == "gitlab":
+            changes = api_json(base, token, "gitlab", f"{target}/changes?access_raw_diffs=true")
+            files = [c for c in (changes.get("changes") or []) if isinstance(c, dict)]
+            diff = "\n".join(f"--- {c.get('new_path', '')}\n{c.get('diff', '')}" for c in files)
+        else:
+            diff = api(base, token, "github", target, accept="application/vnd.github.v3.diff").decode("utf-8", "replace")
+    except (OSError, URLError, ValueError, TypeError):
+        return ""
+    return diff[:MAX_DEBATE_DIFF]
+
+
 def gh_thread(base, token, repo, number):
     """Bounded transcript of a GitHub PR/issue conversation."""
     comments = api_json(base, token, "github", f"/repos/{repo}/issues/{number}/comments?per_page=100")
@@ -423,11 +438,15 @@ def debate(platform, payload, config):
         return False
     if platform == "gitlab":
         thread = gl_thread(base, token, pid, iid, discussion_id)
+        code = bounded_diff(platform, base, token, path)
     else:
         thread = gh_thread(base, token, repo, number)
+        code = bounded_diff(platform, base, token, f"/repos/{repo}/pulls/{number}")
     query = f"Comment by @{commenter}:\n{text}\n\n"
     if thread:
         query += f"Thread so far:\n{thread}\n\n"
+    if code:
+        query += f"Diff under discussion:\n{code}\n\n"
     query += DEBATE_RULES
     answer = re.sub(r"\n?VERDICT:.*$", "", run_hermes(query)).strip()
     if not answer:

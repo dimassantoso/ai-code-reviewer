@@ -672,6 +672,43 @@ class DebateTests(unittest.TestCase):
         self.assertEqual(posts[0][0], "/repos/acme/widgets/issues/3/comments")
         self.assertIn("Reply to @bob", posts[0][1]["body"])
 
+    def test_debate_query_includes_diff_context(self):
+        posts = []
+
+        def fake_api(base, token, platform, path, body=None, accept="application/json"):
+            if body is not None:
+                posts.append((path, body))
+                return b'{"id": 1}'
+            if "/changes" in path:
+                return json.dumps({"changes": [{"new_path": "auth.py",
+                                                "diff": "@@ -0,0 +1 @@\n+return age < limit"}]}).encode()
+            if "/discussions" in path:
+                return json.dumps([{"id": "d1", "notes": [{"author": {"username": "santosodb"},
+                                                           "body": "off by one"}]}]).encode()
+            return json.dumps({"permissions": {"project_access": {"access_level": 40}}}).encode()
+
+        with patch.object(server, "api", side_effect=fake_api), \
+                patch.object(server, "run_hermes", return_value="checked") as hermes:
+            self.assertTrue(server.debate("gitlab", self.payload(), self.config))
+        query = hermes.call_args[0][0]
+        self.assertIn("Diff under discussion:", query)
+        self.assertIn("return age < limit", query)
+        self.assertIn("Thread so far:", query)
+
+    def test_debate_survives_missing_diff(self):
+        def fake_api(base, token, platform, path, body=None, accept="application/json"):
+            if body is not None:
+                return b'{"id": 1}'
+            if "/changes" in path:
+                raise OSError("boom")
+            if "/discussions" in path:
+                return b"[]"
+            return json.dumps({"permissions": {"project_access": {"access_level": 40}}}).encode()
+
+        with patch.object(server, "api", side_effect=fake_api), \
+                patch.object(server, "run_hermes", return_value="ok"):
+            self.assertTrue(server.debate("gitlab", self.payload(), self.config))
+
     def test_low_access_blocks_debate(self):
         with patch.object(server, "api", side_effect=self.fake_api([], level=20)), \
              patch.object(server, "run_hermes") as hermes:
