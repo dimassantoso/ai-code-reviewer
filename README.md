@@ -51,6 +51,7 @@ Copy `.env.example` to `.env` and fill in at least one platform token and its we
 | `MIN_ACCESS_LEVEL` | GitLab access level required to review/reply. Default `30` (Developer). |
 | `APPROVE_ACCESS_LEVEL` | Access level required for auto-approve. Default `40` (Maintainer). |
 | `COOLDOWN_SECONDS` | Per-user per-thread debate cooldown. Default `30`. |
+| `MAX_INLINE` | Inline comments posted per review. Default `20`. |
 
 The server reads environment variables, not `.env` itself. Docker Compose loads `.env` via `env_file`; direct Python users must export it. Use shell-compatible values if sourcing the file.
 
@@ -104,8 +105,9 @@ Compose publishes only `127.0.0.1:9877` and forces the container listener to `0.
 - GitHub: configure `https://<host>/gh-review` for pull request events and JSON payloads. The server verifies `X-Hub-Signature-256`.
 - `GET /health` returns `200 ok`. A disabled platform returns `404`; an invalid signature returns `403`.
 - Valid requests are acknowledged with `202 accepted` before background processing. This is not proof a review was posted; inspect logs and the MR/PR. Duplicate payloads are suppressed in memory for five minutes, not durably across restarts.
-- GitLab open/update/reopen and GitHub opened/synchronize/reopened events trigger review. GitLab gets inline discussions (only for lines present in the diff) plus a summary note; GitHub gets one `COMMENT` review.
-- Auto-approve on GitLab only: verdict `APPROVE`, access ≥ `APPROVE_ACCESS_LEVEL`, author is not the bot, token user has not approved, and `user_can_approve` is not false.
+- GitLab open/update/reopen and GitHub opened/synchronize/reopened events trigger review. Both platforms get inline comments on lines that exist in the diff (GitLab as discussions, GitHub as a batched review) plus a summary; `MAX_INLINE` caps them per review (default 20).
+- Auto-approve: verdict `APPROVE`, target is not a draft, author is not the bot, and the token user may approve. GitLab additionally requires access ≥ `APPROVE_ACCESS_LEVEL` and checks `user_can_approve`; GitHub requires push permission on the repo.
+- A review whose head commit moved while the model was thinking is discarded, so a stale verdict never lands on newer code.
 - Debate: a GitLab note or GitHub comment that `@BOT_USERNAME` and is not our own reply gets an in-thread answer. Per-note dedupe, per-thread cooldown (`COOLDOWN_SECONDS`), and a bounded transcript of that discussion; GitLab additionally requires `MIN_ACCESS_LEVEL`. Bot and `[bot]` authors are ignored. Blank `BOT_USERNAME` disables it.
 - Diffs over 100,000 characters are rejected rather than silently truncated. API and Hermes errors are logged; retries and persistence are not guaranteed after acknowledgement.
 

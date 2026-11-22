@@ -310,15 +310,107 @@ class GitHubFlowTests(unittest.TestCase):
     def payload(self, action="opened"):
         return {"action": action, "number": 5, "repository": {"full_name": "acme/widgets"}}
 
+    DIFF = (b"diff --git a/src/auth.py b/src/auth.py\n--- a/src/auth.py\n+++ b/src/auth.py\n"
+            b"@@ -0,0 +1,2 @@\n+print(1)\n+print(2)\n")
+    REVIEW = ("## Review\n\n### Inline Comments\n"
+              "- `src/auth.py:2` WARNING: Off-by-one check. Fix: use <.\n\n"
+              "VERDICT: APPROVE")
+
+    def fake_api(self, posts, bodies=None):
+        def call(base, token, platform, path, body=None, accept="application/json"):
+            if accept.endswith("diff"):
+                return self.DIFF
+            if body is None:
+                return json.dumps({"title": "Add auth", "body": "why", "user": {"login": "alice"},
+                                   "head": {"ref": "feat"}, "base": {"ref": "main"}}).encode()
+            (posts if posts is not None else bodies).append((path, body))
+            return b"{}"
+        return call
+
     def test_review_posts_comment_review(self):
-        diff = b"--- a/x.py\n+print(1)\n"
-        with patch.object(server, "api", side_effect=[diff, b"{}"]) as api, \
-                patch.object(server, "run_hermes", return_value="## Review\nVERDICT: APPROVE") as hermes:
+        posts = []
+        with patch.object(server, "api", side_effect=self.fake_api(posts)), \
+                patch.object(server, "run_hermes", return_value=self.REVIEW) as hermes:
             self.assertTrue(server.process("github", "pull_request", self.payload(), self.CONFIG))
-        self.assertEqual(hermes.call_args[0][0], diff.decode())
-        path, posted = api.call_args_list[1][0][3], api.call_args_list[1][0][4]
-        self.assertEqual(path, "/repos/acme/widgets/pulls/5/reviews")
-        self.assertEqual(posted, {"body": "## Review\nVERDICT: APPROVE", "event": "COMMENT"})
+        prompt = hermes.call_args[0][0]
+        self.assertIn("print(1)", prompt)
+        self.assertIn("PR #5: Add auth", prompt)
+        self.assertIn("Author: @alice", prompt)
+        self.assertIn("### Inline Comments", prompt)
+        self.assertEqual(len(posts), 1)
+        inline_path, inline_body = posts[0]
+        self.assertEqual(inline_path, "/repos/acme/widgets/pulls/5/reviews")
+        self.assertEqual(inline_body["comments"],
+                         [{"path": "src/auth.py", "line": 2, "side": "RIGHT",
+                           "body": "**WARNING** Off-by-one check.\n\n*Fix:* use <"}])
+        self.assertEqual(inline_body["event"], "COMMENT")
+        self.assertIn("Approved", inline_body["body"])
+        self.assertIn("@alice", inline_body["body"])
+        self.assertNotIn("VERDICT:", inline_body["body"])
+        self.assertNotIn("### Inline Comments", inline_body["body"])
+
+    def test_inline_offsets_use_diff_line_numbers(self):
+        posts = []
+        review = "### Inline Comments\n- `src/auth.py:1` CRITICAL: only line 1 exists.\n\nVERDICT: APPROVE"
+        with patch.object(server, "api", side_effect=self.fake_api(posts)), \
+                patch.object(server, "run_hermes", return_value=review):
+            self.assertTrue(server.process("github", "pull_request", self.payload(), self.CONFIG))
+        self.assertEqual(posts[0][1]["comments"][0]["line"], 1)
+
+    def test_approves_when_token_can_push(self):
+        posts = []
+
+        def fake_api(base, token, platform, path, body=None, accept="application/json"):
+            if accept.endswith("diff"):
+                return self.DIFF
+            if body is None:
+                if path == "/repos/acme/widgets":
+                    return json.dumps({"permissions": {"push": True}}).encode()
+                return json.dumps({"title": "t", "user": {"login": "alice"},
+                                   "head": {"ref": "f"}, "base": {"ref": "main"}}).encode()
+            posts.append((path, body))
+            return b"{}"
+
+        with patch.object(server, "api", side_effect=fake_api), \
+                patch.object(server, "run_hermes", return_value="ok\nVERDICT: APPROVE"):
+            self.assertTrue(server.process("github", "pull_request", self.payload(), self.CONFIG))
+        self.assertEqual(posts[0][1]["event"], "APPROVE")
+
+    def test_draft_pr_not_approved(self):
+        posts = []
+
+        def fake_api(base, token, platform, path, body=None, accept="application/json"):
+            if accept.endswith("diff"):
+                return self.DIFF
+            if body is None:
+                if path == "/repos/acme/widgets":
+                    return json.dumps({"permissions": {"push": True}}).encode()
+                return json.dumps({"title": "t", "draft": True, "user": {"login": "alice"},
+                                   "head": {"ref": "f"}, "base": {"ref": "main"}}).encode()
+            posts.append((path, body))
+            return b"{}"
+
+        with patch.object(server, "api", side_effect=fake_api), \
+                patch.object(server, "run_hermes", return_value="ok\nVERDICT: APPROVE"):
+            self.assertTrue(server.process("github", "pull_request", self.payload(), self.CONFIG))
+        self.assertEqual(posts[0][1]["event"], "COMMENT")
+
+    def test_inline_cap_respected(self):
+        posts = []
+        lines = "".join(f"- `src/auth.py:{n}` WARNING: issue {n}.\n" for n in (1, 2))
+        with patch.object(server, "MAX_INLINE", 1), \
+                patch.object(server, "api", side_effect=self.fake_api(posts)), \
+                patch.object(server, "run_hermes", return_value="### Inline Comments\n" + lines + "\nVERDICT: APPROVE"):
+            self.assertTrue(server.process("github", "pull_request", self.payload(), self.CONFIG))
+        self.assertEqual(len(posts[0][1]["comments"]), 1)
+
+    def test_no_inline_section_still_posts_summary(self):
+        posts = []
+        with patch.object(server, "api", side_effect=self.fake_api(posts)), \
+                patch.object(server, "run_hermes", return_value="LGTM\nVERDICT: APPROVE"):
+            self.assertTrue(server.process("github", "pull_request", self.payload(), self.CONFIG))
+        self.assertEqual(len(posts), 1)
+        self.assertNotIn("comments", posts[0][1])
 
     def test_ignores_other_actions_and_events(self):
         with patch.object(server, "api") as api:
@@ -397,6 +489,7 @@ class InlineTests(unittest.TestCase):
         self.assertIn("@alice", body)
         self.assertIn("Summary here.", body)
         self.assertNotIn("### Inline Comments", body)
+        self.assertNotIn("Off-by-one", body)
         self.assertNotIn("VERDICT:", body)
 
     def test_inline_posted_only_for_real_lines(self):
@@ -496,6 +589,31 @@ class DebateTests(unittest.TestCase):
             self.assertFalse(server.debate("gitlab", self.payload(note_id=8), self.config))
         self.assertEqual(len(posts), 1)
 
+    def test_github_debate_uses_thread_and_replies(self):
+        posts = []
+
+        def fake_api(base, token, platform, path, body=None, accept="application/json"):
+            if body is None:
+                if "/comments" in path:
+                    return json.dumps([{"user": {"login": "alice"}, "body": "the check is wrong"},
+                                       {"user": {"login": "santosodb"}, "body": "no it is not"}]).encode()
+                return b"{}"
+            posts.append((path, body))
+            return b'{"id": 1}'
+
+        payload = {"action": "created", "repository": {"full_name": "acme/widgets"},
+                   "issue": {"number": 3},
+                   "comment": {"id": 11, "body": "@santosodb why?", "user": {"login": "bob"}}}
+        with patch.object(server, "api", side_effect=fake_api), \
+                patch.object(server, "run_hermes", return_value="Because of x.") as hermes:
+            self.assertTrue(server.debate("github", payload,
+                                          {"token": "gh", "secret": SECRET, "url": "https://api.github.com"}))
+        query = hermes.call_args[0][0]
+        self.assertIn("Thread so far:", query)
+        self.assertIn("@alice: the check is wrong", query)
+        self.assertEqual(posts[0][0], "/repos/acme/widgets/issues/3/comments")
+        self.assertIn("Reply to @bob", posts[0][1]["body"])
+
     def test_low_access_blocks_debate(self):
         with patch.object(server, "api", side_effect=self.fake_api([], level=20)), \
              patch.object(server, "run_hermes") as hermes:
@@ -507,6 +625,147 @@ class DebateTests(unittest.TestCase):
         with patch.object(server, "run_hermes") as hermes:
             self.assertFalse(server.debate("gitlab", self.payload(), self.config))
         hermes.assert_not_called()
+
+
+class StaleReviewTests(unittest.TestCase):
+    CONFIG = {"token": "gl", "secret": SECRET, "url": "https://gitlab.example.com"}
+
+    def test_moved_head_discards_result(self):
+        posted = []
+        heads = iter(["sha-old", "sha-new"])
+
+        def fake_api(base, token, platform, path, body=None, accept="application/json"):
+            if path == "/projects/1":
+                return json.dumps({"permissions": {"project_access": {"access_level": 40}}}).encode()
+            if "/changes" in path:
+                return json.dumps({"changes": [{"new_path": "a.py", "diff": "@@ -0,0 +1 @@\n+x"}],
+                                   "overflow": False}).encode()
+            if body is not None:
+                posted.append((path, body))
+                return b'{"id": 1}'
+            return json.dumps({"author": {"username": "alice"},
+                               "diff_refs": {"head_sha": next(heads)}}).encode()
+
+        with patch.object(server, "api", side_effect=fake_api), \
+                patch.object(server, "run_hermes", return_value="ok\nVERDICT: APPROVE"):
+            self.assertFalse(server.process("gitlab", "Merge Request Hook", {
+                "object_kind": "merge_request", "project": {"id": 1},
+                "object_attributes": {"iid": 2, "action": "update"}}, self.CONFIG))
+        self.assertEqual(posted, [])
+
+    def test_superseded_helper_edge_cases(self):
+        job = {"base": "b", "token": "t", "path": "/p", "head": ""}
+        self.assertFalse(server.superseded("gitlab", job, self.CONFIG))  # unknown head: post anyway
+        job["head"] = "sha"
+        with patch.object(server, "api_json", return_value={}):
+            self.assertFalse(server.superseded("gitlab", job, self.CONFIG))  # head gone: post anyway
+
+
+class DraftTests(unittest.TestCase):
+    HARMLESS_GL = {"token": "gl", "secret": SECRET, "url": "https://gitlab.example.com"}
+
+    def test_draft_mr_is_reviewed_but_not_approved(self):
+        def fake_api(base, token, platform, path, body=None, accept="application/json"):
+            if path == "/projects/1":
+                return json.dumps({"permissions": {"project_access": {"access_level": 40}}}).encode()
+            if "/changes" in path:
+                return json.dumps({"changes": [{"new_path": "a.py", "diff": "@@ -0,0 +1 @@\n+x"}],
+                                   "overflow": False}).encode()
+            if path.endswith("/approvals"):
+                raise AssertionError("must not approve a draft")
+            if body is not None:
+                return b'{"id": 1}'
+            return json.dumps({"author": {"username": "alice"}, "diff_refs": {}}).encode()
+
+        with patch.object(server, "api", side_effect=fake_api), \
+                patch.object(server, "run_hermes", return_value="fine\nVERDICT: APPROVE"):
+            self.assertTrue(server.process("gitlab", "Merge Request Hook", {
+                "object_kind": "merge_request", "project": {"id": 1},
+                "object_attributes": {"iid": 2, "action": "update", "title": "Draft: wip"}},
+                self.HARMLESS_GL))
+
+    def test_non_draft_approves(self):
+        calls = []
+
+        def fake_api(base, token, platform, path, body=None, accept="application/json"):
+            calls.append(path)
+            if path == "/projects/1":
+                return json.dumps({"permissions": {"project_access": {"access_level": 40}}}).encode()
+            if "/changes" in path:
+                return json.dumps({"changes": [{"new_path": "a.py", "diff": "@@ -0,0 +1 @@\n+x"}],
+                                   "overflow": False}).encode()
+            if path.endswith("/approvals") and body is None:
+                return b'{"user_has_approved": false, "user_can_approve": true}'
+            return b'{"id": 1}'
+
+        with patch.object(server, "api", side_effect=fake_api), \
+                patch.object(server, "run_hermes", return_value="fine\nVERDICT: APPROVE"):
+            self.assertTrue(server.process("gitlab", "Merge Request Hook", {
+                "object_kind": "merge_request", "project": {"id": 1},
+                "object_attributes": {"iid": 2, "action": "update", "title": "Add auth"}},
+                self.HARMLESS_GL))
+        self.assertIn("/projects/1/merge_requests/2/approve", calls)
+
+
+class GuardTests(unittest.TestCase):
+    GL = {"token": "gl", "secret": SECRET, "url": "https://gitlab.example.com"}
+    GH = {"token": "gh", "secret": SECRET, "url": "https://api.github.com"}
+
+    def tearDown(self):
+        server.BOT_USERNAME = ""
+
+    def test_split_diff_paths(self):
+        raw = ("diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n@@ -1 +1 @@\n+x\n"
+               "diff --git a/b.py b/b.py\n--- a/b.py\n+++ b/b.py\n@@ -1 +1 @@\n+y\n")
+        self.assertEqual([f["new_path"] for f in server.split_diff(raw)], ["src/a.py", "b.py"])
+        self.assertEqual(server.split_diff(""), [])
+
+    def test_verdict_uses_last_verdict_line(self):
+        self.assertEqual(server.verdict_of("VERDICT: REQUEST_CHANGES\nok now\nVERDICT: APPROVE"), "APPROVE")
+        self.assertEqual(server.verdict_of("VERDICT: APPROVE"), "APPROVE")
+        self.assertEqual(server.verdict_of("VERDICT: APPROVE\nVERDICT: REQUEST_CHANGES"), "REQUEST_CHANGES")
+
+    def test_bot_author_not_reviewed(self):
+        server.BOT_USERNAME = "santosodb"
+        def fake_api(base, token, platform, path, body=None, accept="application/json"):
+            if path == "/projects/1":
+                return json.dumps({"permissions": {"project_access": {"access_level": 40}}}).encode()
+            if path.endswith("/changes?access_raw_diffs=true"):
+                return json.dumps({"changes": [{"new_path": "a.py", "diff": "+x"}], "overflow": False}).encode()
+            return json.dumps({"author": {"username": "santosodb"}, "diff_refs": {}}).encode()
+        with patch.object(server, "api", side_effect=fake_api), patch.object(server, "run_hermes") as hermes:
+            self.assertFalse(server.process("gitlab", "Merge Request Hook", {
+                "object_kind": "merge_request", "project": {"id": 1},
+                "object_attributes": {"iid": 2, "action": "update"}}, self.GL))
+        hermes.assert_not_called()
+
+    def test_already_reviewed_open_mr_skipped(self):
+        def fake_api(base, token, platform, path, body=None, accept="application/json"):
+            if path == "/projects/1":
+                return json.dumps({"permissions": {"project_access": {"access_level": 40}}}).encode()
+            if "/notes" in path:
+                return json.dumps([{"body": "<!-- ai-review -->\nold review"}]).encode()
+            return b"{}"
+        with patch.object(server, "api", side_effect=fake_api), patch.object(server, "run_hermes") as hermes:
+            self.assertFalse(server.process("gitlab", "Merge Request Hook", {
+                "object_kind": "merge_request", "project": {"id": 1},
+                "object_attributes": {"iid": 2, "action": "open"}}, self.GL))
+        hermes.assert_not_called()
+
+    def test_github_debate_rejects_bad_repo(self):
+        payload = {"action": "created", "repository": {"full_name": "../../x"},
+                   "issue": {"number": 3}, "comment": {"id": 1, "body": "@santosodb hi",
+                                                       "user": {"login": "alice"}}}
+        with patch.object(server, "api") as api, patch.object(server, "run_hermes") as hermes:
+            self.assertFalse(server.debate("github", payload, self.GH))
+        api.assert_not_called()
+        hermes.assert_not_called()
+
+    def test_repo_name_validator(self):
+        for good in ("acme/widgets", "a/b", "org/repo.js"):
+            self.assertTrue(server.is_repo_name(good), good)
+        for bad in ("acme", "a/b/c", "../x", "", None, "a/.."):
+            self.assertFalse(server.is_repo_name(bad), bad)
 
 
 class ClaimTests(unittest.TestCase):

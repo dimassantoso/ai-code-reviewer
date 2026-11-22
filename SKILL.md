@@ -49,7 +49,8 @@ Secrets are mandatory — no dev bypass.
 2. Review path: GitLab access gate (`MIN_ACCESS_LEVEL`), skip if already reviewed on `open`, fetch diff.
 3. Cap diff at 100 KB — larger is rejected, never silently truncated.
 4. Shell out to `hermes chat --query-file - -t "" -Q --max-turns 5`, with platform tokens stripped from the child env.
-5. GitLab: post each inline comment that lands on a real new-side diff line, then the summary note. Approve when verdict is `APPROVE` and access ≥ `APPROVE_ACCESS_LEVEL`. GitHub: one `COMMENT` review.
+5. Post inline comments that land on a real new-side diff line (GitLab: discussions + summary note; GitHub: one batched review with inline comments, max `MAX_INLINE`), then the summary. Approve when verdict is `APPROVE`, the target is not a draft, and the token user may approve (GitLab: access ≥ `APPROVE_ACCESS_LEVEL` and `user_can_approve`; GitHub: push permission).
+6. Re-read the head commit after the model returns; discard the review if it moved.
 
 Debate path (comment event with `@BOT_USERNAME`): dedupe per note, per-thread cooldown, access gate, then reply inside the same thread using a bounded transcript of that discussion.
 
@@ -60,7 +61,6 @@ No approval, merge, or code change. No thread-debate replies, access-level gatin
 ## Not implemented
 
 - Durable dedupe or retry: an accepted job is lost if the process dies.
-- GitHub inline per-line comments (GitLab inline works).
 
 Add these when a real user asks; each is a separate feature, listed so behaviour is not over-claimed.
 
