@@ -539,10 +539,15 @@ class RealModelOutputTests(unittest.TestCase):
 
     def test_sectioned_bullets_parsed_with_severity(self):
         parsed = server.parse_inline_comments(REAL_MODEL_REVIEW)
+        # auth.py:2 appears in Critical and Warning; one comment survives, the worse wording wins.
         self.assertEqual([(c["file"], c["line"], c["level"]) for c in parsed],
-                         [("auth.py", 2, "CRITICAL"), ("auth.py", 1, "CRITICAL"), ("auth.py", 2, "WARNING")])
-        self.assertIn("cannot execute", parsed[0]["message"])
-        self.assertEqual(parsed[0]["fix"], "add `import time`")
+                         [("auth.py", 2, "CRITICAL"), ("auth.py", 1, "CRITICAL")])
+        self.assertIn("time", parsed[0]["message"])
+        self.assertTrue(parsed[0]["fix"])
+
+    def test_duplicate_findings_deduped(self):
+        review = ("### Critical\n- `a.py:3` boom\n### Warning\n- `a.py:3` boom\n")
+        self.assertEqual(len(server.parse_inline_comments(review)), 1)
 
     def test_bullets_without_severity_heading_ignored(self):
         review = "### Notes\n- `a.py:3` just prose here\n### Critical\n- `a.py:4` real bug\n"

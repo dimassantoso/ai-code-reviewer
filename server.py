@@ -118,6 +118,7 @@ def bot_mentioned(text):
 
 SEVERITY_HEADING = re.compile(r"(?i)\b(critical|warning|suggestion|nit)\b")
 LEVELS = {"CRITICAL": "CRITICAL", "WARNING": "WARNING", "SUGGESTION": "SUGGESTION", "NIT": "SUGGESTION"}
+LEVEL_ORDER = {"SUGGESTION": 1, "WARNING": 2, "CRITICAL": 3}
 
 
 def parse_inline_comments(review_text):
@@ -151,9 +152,17 @@ def parse_inline_comments(review_text):
         split = re.match(r"(.*?)[.;]?\s*\*{0,2}Fix:?\*{0,2}\s*(.+)$", text)
         if split:
             message, fix = split.group(1) + ".", split.group(2)
-        comments.append({"file": path.strip(), "line": int(number), "level": level_name,
-                         "message": message.strip().strip("*").strip(),
-                         "fix": fix.strip().strip("*").rstrip(".")})
+        comment = {"file": path.strip(), "line": int(number), "level": level_name,
+                   "message": message.strip().strip("*").strip(),
+                   "fix": fix.strip().strip("*").rstrip(".")}
+        duplicate = next((c for c in comments if c["file"] == comment["file"]
+                          and c["line"] == comment["line"]), None)
+        if duplicate is not None:
+            # Same line reported twice: keep the most severe wording, one comment per line.
+            if LEVEL_ORDER[comment["level"]] > LEVEL_ORDER[duplicate["level"]]:
+                duplicate.update(comment)
+        else:
+            comments.append(comment)
     return comments
 
 
