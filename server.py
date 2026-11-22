@@ -68,6 +68,8 @@ def run_hermes(diff):
               "Give actionable correctness, security and testing findings with file and line numbers. "
               "Do not modify code, run commands, approve or merge. Respond in English.\n\n" + diff)
     cmd = [os.getenv("HERMES_BIN", "hermes"), "chat", "--query-file", "-", "-t", "", "-Q", "--max-turns", "5"]
+    if os.getenv("HERMES_PROFILE"):
+        cmd[1:1] = ["-p", os.environ["HERMES_PROFILE"]]
     if os.getenv("HERMES_MODEL"):
         cmd += ["-m", os.environ["HERMES_MODEL"]]
     if os.getenv("HERMES_SKILL"):

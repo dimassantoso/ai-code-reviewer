@@ -387,6 +387,17 @@ class HermesTests(unittest.TestCase):
         os.environ.update(GITLAB_TOKEN="leak", HERMES_MODEL="m1")
         self.assertEqual(server.run_hermes("diff"), "|m1")
 
+    def test_profile_flag_precedes_chat(self):
+        self.script('cat >/dev/null\nprintf "%s" "$*"\n')
+        os.environ["HERMES_PROFILE"] = "codereview"
+        server.run_hermes("diff")
+        # the stub cannot see argv, so assert the builder through a recorded run
+        recorded = []
+        with patch.object(server.subprocess, "run", side_effect=lambda cmd, **kw: recorded.append(cmd) or type("R", (), {"stdout": "ok"})()):
+            server.run_hermes("diff")
+        self.assertEqual(recorded[0][1:3], ["-p", "codereview"])
+        self.assertEqual(recorded[0][3], "chat")
+
     def test_strips_session_id_trailer(self):
         self.script('cat >/dev/null\nprintf "review text\\n\\nsession_id: local-abc\\n"\n')
         self.assertEqual(server.run_hermes("diff"), "review text")
