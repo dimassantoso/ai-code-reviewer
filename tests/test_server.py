@@ -637,6 +637,62 @@ class RemarkTests(unittest.TestCase):
                          "MR action 'close' does not trigger a review")
 
 
+class DebateRemarkTests(unittest.TestCase):
+    """A debate reply that does not happen must say why."""
+
+    def run_debate(self, payload, bot="santosodb"):
+        seen = {}
+        old = server.BOT_USERNAME
+        server.BOT_USERNAME = bot
+        try:
+            with patch.object(server, "api"), patch.object(server, "run_hermes") as hermes:
+                result = server.debate("gitlab", payload, GL_CONFIG, lambda stage, **kw: seen.update(kw))
+        finally:
+            server.BOT_USERNAME = old
+        return result, seen, hermes
+
+    def note(self, text, commenter="alice", kind="MergeRequest"):
+        return {"object_kind": "note", "user": {"username": commenter}, "project_id": 1,
+                "merge_request": {"iid": 2, "author": {"username": "dimas"}},
+                "object_attributes": {"noteable_type": kind, "note": text, "noteable_iid": 2,
+                                      "id": 9, "discussion_id": "d1"}}
+
+    def test_no_bot_username(self):
+        _, seen, _ = self.run_debate(self.note("@santosodb hi"), bot="")
+        self.assertIn("BOT_USERNAME", seen["remark"])
+
+    def test_no_mention(self):
+        _, seen, _ = self.run_debate(self.note("looks good"))
+        self.assertIn("does not mention", seen["remark"])
+
+    def test_own_reply(self):
+        _, seen, _ = self.run_debate(self.note("<!-- ai-review -->\n@santosodb answer"))
+        self.assertIn("our own replies", seen["remark"])
+
+    def test_bot_commenter(self):
+        _, seen, _ = self.run_debate(self.note("@santosodb hi", commenter="dependabot[bot]"))
+        self.assertIn("written by a bot", seen["remark"])
+
+    def test_not_a_merge_request_note(self):
+        _, seen, _ = self.run_debate(self.note("@santosodb hi", kind="Commit"))
+        self.assertIn("not on a merge request", seen["remark"])
+
+    def test_low_access(self):
+        payload = self.note("@santosodb hi")
+        seen = {}
+        old = server.BOT_USERNAME
+        server.BOT_USERNAME = "santosodb"
+        try:
+            with patch.object(server, "gl_access_level", return_value=10), \
+                    patch.object(server, "api"), patch.object(server, "run_hermes") as hermes:
+                self.assertFalse(server.debate("gitlab", payload, GL_CONFIG,
+                                               lambda stage, **kw: seen.update(kw)))
+        finally:
+            server.BOT_USERNAME = old
+        hermes.assert_not_called()
+        self.assertIn("MIN_ACCESS_LEVEL", seen["remark"])
+
+
 class ApiRetryTests(unittest.TestCase):
     """A dropped connection must not fail the review; a bad response must."""
 

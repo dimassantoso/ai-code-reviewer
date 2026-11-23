@@ -562,15 +562,22 @@ DEBATE_RULES = (
 )
 
 
-def debate(platform, payload, config):
+def debate(platform, payload, config, track=None):
     """Reply to an @mention inside its own thread. Returns True if a reply was posted."""
-    if not BOT_USERNAME:
+    def skip(reason):
+        """Not answered, and the dashboard says why."""
+        if track:
+            track("skipped", remark=reason)
         return False
+
+    if not BOT_USERNAME:
+        return skip("BOT_USERNAME is not set, so @mentions are not answered")
     base, token = config["url"] + "/api/v4", config["token"]
     if platform == "gitlab":
         attrs = payload.get("object_attributes") or {}
-        if payload.get("object_kind") != "note" or attrs.get("noteable_type") != "MergeRequest":
-            return False
+        noteable = attrs.get("noteable_type")
+        if payload.get("object_kind") != "note" or noteable != "MergeRequest":
+            return skip("note is not on a merge request (noteable_type %r)" % noteable)
         text = attrs.get("note") or ""
         pid = payload.get("project_id") or (payload.get("project") or {}).get("id")
         iid, discussion_id, note_id = attrs.get("noteable_iid"), attrs.get("discussion_id", ""), attrs.get("id")
@@ -579,7 +586,7 @@ def debate(platform, payload, config):
         reply_path = (path + f"/discussions/{discussion_id}/notes") if discussion_id else path + "/notes"
     else:
         if payload.get("action") != "created":
-            return False
+            return skip("comment action %r is not a new comment" % payload.get("action"))
         comment = payload.get("comment") or {}
         text = comment.get("body") or ""
         issue = payload.get("issue") or payload.get("pull_request") or {}
@@ -587,20 +594,24 @@ def debate(platform, payload, config):
         number, note_id = (payload.get("pull_request") or issue).get("number"), comment.get("id")
         commenter = (comment.get("user") or {}).get("login", "")
         if not is_repo_name(repo) or not positive(number):
-            return False
+            return skip("cannot resolve the repository or pull request number")
         path = f"/repos/{repo}/issues/{number}"
         reply_path = path + "/comments"
         discussion_id = ""
-    if REVIEW_MARKER in text or not bot_mentioned(text):
-        return False
-    if not commenter or commenter == BOT_USERNAME or commenter.endswith("[bot]"):
-        return False
+    if REVIEW_MARKER in text:
+        return skip("comment is one of our own replies")
+    if not bot_mentioned(text):
+        return skip("comment does not mention @%s" % BOT_USERNAME)
+    if not commenter:
+        return skip("comment has no author")
+    if commenter == BOT_USERNAME or commenter.endswith("[bot]"):
+        return skip("comment was written by a bot")
     if platform == "gitlab" and (not positive(pid) or not positive(iid)):
-        return False
+        return skip("cannot resolve the project or merge request id")
     key = (discussion_id, note_id)
     with _replied_lock:
         if key in _replied:
-            return False
+            return skip("this comment was already answered")
         if len(_replied) > 5000:
             _replied.clear()
         _replied.add(key)
@@ -610,11 +621,14 @@ def debate(platform, payload, config):
             _cooldown.clear()  # ponytail: whole-map reset, not LRU; costs one extra reply per thread
         if now - _cooldown.get((discussion_id, commenter), 0) < COOLDOWN_SECONDS:
             LOG.info("cooldown active for @%s, skipping", commenter)
-            return False
+            return skip("cooldown: @%s was answered less than %ss ago" % (commenter, COOLDOWN_SECONDS))
         _cooldown[(discussion_id, commenter)] = now
-    if platform == "gitlab" and gl_access_level(base, token, pid) < MIN_ACCESS_LEVEL:
-        LOG.info("access level below MIN_ACCESS_LEVEL, skipping debate reply")
-        return False
+    if platform == "gitlab":
+        level = gl_access_level(base, token, pid)
+        if level < MIN_ACCESS_LEVEL:
+            LOG.info("access level below MIN_ACCESS_LEVEL, skipping debate reply")
+            return skip("@%s has access level %s, below MIN_ACCESS_LEVEL %s"
+                        % (commenter, level, MIN_ACCESS_LEVEL))
     if platform == "gitlab":
         thread = gl_thread(base, token, pid, iid, discussion_id)
         code = bounded_diff(platform, base, token, path)
@@ -629,7 +643,7 @@ def debate(platform, payload, config):
     query += DEBATE_RULES
     answer = re.sub(r"\n?VERDICT:.*$", "", run_hermes(query)).strip()
     if not answer:
-        return False
+        return skip("the model returned an empty reply")
     body = f"{REVIEW_MARKER}\n### \U0001f4ac Reply to @{commenter}\n\n{answer}\n\n---\n\U0001f916 *Hermes Agent (ai-code-reviewer)*"
     api(base, token, platform, reply_path, {"body": body})
     return True
@@ -881,7 +895,7 @@ def run_job(platform, event, payload, cfg, raw, key):
     try:
         with target_lock(key):
             if is_note_event(platform, payload):
-                posted = debate(platform, payload, cfg)
+                posted = debate(platform, payload, cfg, track)
             else:
                 posted = process(platform, event, payload, cfg, track)
             LOG.info("%s review: %s", platform, "posted" if posted else "ignored")
