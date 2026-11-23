@@ -5,7 +5,9 @@ UNIT  := pasarpolis-ai-code-reviewer
 DIR   := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 ENV   := $(DIR)/.env
 LOG   := $(DIR)/server.log
-STORE := $(DIR)/$(patsubst ./%,%,$(or $(shell grep -m1 '^REVIEW_STORE=' $(ENV) 2>/dev/null | cut -d= -f2),reviews.jsonl))
+# REVIEW_STORE may be relative to DIR (./reviews.jsonl) or absolute.
+STORE_RAW := $(or $(shell grep -m1 '^REVIEW_STORE=' $(ENV) 2>/dev/null | cut -d= -f2),reviews.jsonl)
+STORE := $(if $(filter /%,$(STORE_RAW)),$(STORE_RAW),$(DIR)/$(patsubst ./%,%,$(STORE_RAW)))
 PORT  := $(or $(shell grep -m1 '^BIND_PORT=' $(ENV) 2>/dev/null | cut -d= -f2 | cut -d, -f1),9877)
 # Prefer the MagicDNS name (survives IP changes), fall back to the tailnet IP.
 HOST  := $(or $(shell tailscale status --json 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))' 2>/dev/null),$(or $(shell tailscale ip -4 2>/dev/null | head -1),127.0.0.1))
