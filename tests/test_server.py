@@ -254,6 +254,8 @@ class EndToEndTests(unittest.TestCase):
 
     def setUp(self):
         server._seen.clear()
+        server._reviewed.clear()
+        server._whoami_cache.clear()
 
     def post(self, raw, headers):
         request = Request(self.base + "/gl-review", data=raw, headers=headers, method="POST")
@@ -273,6 +275,7 @@ class EndToEndTests(unittest.TestCase):
 
     def test_review_end_to_end(self):
         ApiStub.notes.clear()
+        ApiStub.overflow = False
         payload = {
             "object_kind": "merge_request",
             "project": {"id": 1},
@@ -283,8 +286,9 @@ class EndToEndTests(unittest.TestCase):
             status, body = self.post(raw, {"X-Gitlab-Token": SECRET, "X-Gitlab-Event": "Merge Request Hook"})
             self.assertEqual((status, body), (202, "accepted"))
             self.assertTrue(self.wait_for_notes())
-        self.assertEqual(len(ApiStub.notes), 1)
-        path, posted, token = ApiStub.notes[0]
+        notes = [n for n in ApiStub.notes if n[0].endswith("/notes")]
+        self.assertEqual(len(notes), 1)
+        path, posted, token = notes[0]
         self.assertEqual(path, "/api/v4/projects/1/merge_requests/2/notes")
         self.assertEqual(token, "gl-token")
         self.assertIn("<!-- ai-review -->", posted["body"])
@@ -303,14 +307,24 @@ class EndToEndTests(unittest.TestCase):
         self.assertFalse(self.wait_for_notes(timeout=1))
         self.assertEqual(ApiStub.notes, [])
 
-    def test_rejects_oversized_diff(self):
+    def test_oversized_diff_is_reviewed_in_chunks(self):
         ApiStub.notes.clear()
+        server._reviewed.clear()
+        server._whoami_cache.clear()
         raw = json.dumps({"object_kind": "merge_request", "project": {"id": 1},
                           "object_attributes": {"iid": 2, "action": "open"}}).encode()
         with patch.object(server, "MAX_DIFF", 5), patch.dict(os.environ, {"HERMES_BIN": self.hermes}):
             self.assertEqual(self.post(raw, {"X-Gitlab-Token": SECRET, "X-Gitlab-Event": "Merge Request Hook"})[0], 202)
-            self.assertFalse(self.wait_for_notes(timeout=1))
-        self.assertEqual(ApiStub.notes, [])
+            self.assertTrue(self.wait_for_notes(timeout=15))
+            # wait for the terminal approve POST, so the job cannot leak into the next test
+            deadline = time.time() + 15
+            while time.time() < deadline and not any(n[0].endswith("/approve") for n in ApiStub.notes):
+                time.sleep(0.05)
+        body = [n for n in ApiStub.notes if n[0].endswith("/notes")][0][1]["body"]
+        self.assertIn("<!-- ai-review -->", body)
+        self.assertIn("MR author: @alice", body)
+        with open(self.hermes + ".stdin") as handle:
+            self.assertIn("part 1 of", handle.read())
 
 
 class IsolatedCase(unittest.TestCase):
@@ -457,6 +471,8 @@ class GitLabFlowTests(unittest.TestCase):
 
     def test_overflow_blocks_review(self):
         def fake_api(base, token, platform, path, body=None, accept="application/json"):
+            if path == "/user":
+                return json.dumps({"username": "santosodb"}).encode()
             if path == "/projects/1":
                 return json.dumps({"permissions": {"project_access": {"access_level": 40}}}).encode()
             return b'{"changes": [], "overflow": true}'
@@ -647,6 +663,8 @@ class RemarkTests(unittest.TestCase):
         payload = {"object_kind": "merge_request", "project": {"id": 1},
                    "object_attributes": {"iid": 2, "action": "update"}}
         def fake_api(base, token, platform, path, body=None, accept="application/json"):
+            if path == "/user":
+                return json.dumps({"username": "santosodb"}).encode()
             if path == "/projects/1":
                 return json.dumps({"permissions": {"project_access": {"access_level": 40}}}).encode()
             if path.endswith("/changes?access_raw_diffs=true"):
@@ -724,6 +742,87 @@ class DebateRemarkTests(unittest.TestCase):
             server.BOT_USERNAME = old
         hermes.assert_not_called()
         self.assertIn("MIN_ACCESS_LEVEL", seen["remark"])
+
+
+class ChunkedReviewTests(unittest.TestCase):
+    """Diffs over MAX_DIFF are reviewed in parts, never rejected."""
+
+    def files(self, count, size):
+        return [{"new_path": "f%d.py" % i, "diff": "\n".join(
+            ["@@ -1,%d +1,%d @@" % (size, size)] + ["+line %d of file %d" % (n, i) for n in range(size)])}
+            for i in range(count)]
+
+    def test_small_diff_is_one_call(self):
+        calls = []
+        with patch.object(server, "run_hermes", side_effect=lambda q: calls.append(q) or "ok\nVERDICT: APPROVE"):
+            out = server.review_diff("HDR", "+x" * 100, self.files(1, 3))
+        self.assertEqual(len(calls), 1)
+        self.assertIn("APPROVE", out)
+
+    def test_oversized_diff_is_chunked_and_never_rejected(self):
+        files = self.files(120, 60)
+        total = sum(len(f["diff"]) for f in files)
+        self.assertGreater(total, server.MAX_DIFF)
+        calls = []
+        with patch.object(server, "run_hermes", side_effect=lambda q: calls.append(q) or "finding\nVERDICT: APPROVE"):
+            out = server.review_diff("HDR", "\n".join(f["diff"] for f in files), files)
+        self.assertGreater(len(calls), 1)
+        for i, chunk in enumerate(calls, 1):
+            self.assertIn("part %d of %d" % (i, len(calls)), chunk)
+            self.assertLessEqual(len(chunk), server.MAX_DIFF + len("HDR") + 200)
+        self.assertIn("APPROVE", out)
+
+    def test_chunks_cover_every_file(self):
+        files = self.files(30, 40)
+        joined = "\n".join(server.chunks_of(files, limit=2000))
+        for i in range(30):
+            self.assertIn("f%d.py" % i, joined)
+
+    def test_single_file_bigger_than_limit_splits_at_hunks(self):
+        big = {"new_path": "big.py", "diff": "\n".join(
+            ["@@ -%d,2 +%d,2 @@" % (n, n) for n in range(1, 400)] + ["+padding line %d" % n for n in range(300)])}
+        chunks = server.chunks_of([big], limit=1000)
+        self.assertGreater(len(chunks), 1)
+        for c in chunks:
+            self.assertIn("big.py", c)
+            self.assertLessEqual(len(c), 1200)
+
+    def test_merged_verdict_keeps_the_strictest(self):
+        merged = server.merge_reviews(["looks fine\nVERDICT: APPROVE",
+                                       "bug here\nVERDICT: REQUEST_CHANGES"])
+        self.assertIn("REQUEST_CHANGES", merged)
+        self.assertIn("bug here", merged)
+        self.assertNotIn("VERDICT: APPROVE", merged)
+
+
+class ReviewerFlagTests(unittest.TestCase):
+    """Comments distinguish the MR author from the reviewing bot."""
+
+    def test_footer_names_author_and_reviewer(self):
+        body = server.review_body("ok\nVERDICT: APPROVE", "dimas", "APPROVE", reviewer="santosodb")
+        self.assertIn("MR author: @dimas", body)
+        self.assertIn("Reviewer: @santosodb (bot)", body)
+
+    def test_footer_without_a_known_reviewer(self):
+        body = server.review_body("ok\nVERDICT: APPROVE", "dimas", "APPROVE")
+        self.assertIn("MR author: @dimas", body)
+        self.assertIn("Reviewer: Hermes Agent (bot)", body)
+
+    def test_author_is_not_listed_as_reviewer(self):
+        body = server.review_body("ok", "dimas", "APPROVE", reviewer="santosodb")
+        self.assertNotIn("Reviewer: @dimas", body)
+
+    def test_reviewer_is_looked_up_and_cached(self):
+        server._whoami_cache.clear()
+        with patch.object(server, "api_json", return_value={"username": "santosodb"}) as a:
+            self.assertEqual(server.reviewer_of("gitlab", "https://gl", "t"), "santosodb")
+            self.assertEqual(server.reviewer_of("gitlab", "https://gl", "t"), "santosodb")
+        self.assertEqual(a.call_count, 1)
+
+    def test_lookup_failure_does_not_break_the_review(self):
+        server._whoami_cache.clear()
+        with patch.object(server, "api_json", side_effect=server.URLError("down")):
+            self.assertEqual(server.reviewer_of("gitlab", "https://gl2", "t"), "")
 
 
 class ApiRetryTests(unittest.TestCase):
@@ -1203,6 +1302,8 @@ class StaleReviewTests(unittest.TestCase):
         heads = iter(["sha-old", "sha-new"])
 
         def fake_api(base, token, platform, path, body=None, accept="application/json"):
+            if path == "/user":
+                return json.dumps({"username": "santosodb"}).encode()
             if path == "/projects/1":
                 return json.dumps({"permissions": {"project_access": {"access_level": 40}}}).encode()
             if "/changes" in path:
@@ -1234,6 +1335,8 @@ class DraftTests(unittest.TestCase):
 
     def test_draft_mr_is_reviewed_but_not_approved(self):
         def fake_api(base, token, platform, path, body=None, accept="application/json"):
+            if path == "/user":
+                return json.dumps({"username": "santosodb"}).encode()
             if path == "/projects/1":
                 return json.dumps({"permissions": {"project_access": {"access_level": 40}}}).encode()
             if "/changes" in path:
@@ -1297,6 +1400,8 @@ class GuardTests(unittest.TestCase):
         """The bot's own MRs are reviewed: BOT_USERNAME is the webhook user, not a skip list."""
         server.BOT_USERNAME = "santosodb"
         def fake_api(base, token, platform, path, body=None, accept="application/json"):
+            if path == "/user":
+                return json.dumps({"username": "santosodb"}).encode()
             if path == "/projects/1":
                 return json.dumps({"permissions": {"project_access": {"access_level": 40}}}).encode()
             if path.endswith("/changes?access_raw_diffs=true"):
@@ -1314,6 +1419,8 @@ class GuardTests(unittest.TestCase):
         server._reviewed.clear()
         calls = {"n": 0}
         def fake_api(base, token, platform, path, body=None, accept="application/json"):
+            if path == "/user":
+                return json.dumps({"username": "santosodb"}).encode()
             if path == "/projects/1":
                 return json.dumps({"permissions": {"project_access": {"access_level": 40}}}).encode()
             if path.endswith("/changes?access_raw_diffs=true"):
@@ -1334,6 +1441,8 @@ class GuardTests(unittest.TestCase):
         server._reviewed.clear()
         heads = {"sha": "aaa"}
         def fake_api(base, token, platform, path, body=None, accept="application/json"):
+            if path == "/user":
+                return json.dumps({"username": "santosodb"}).encode()
             if path == "/projects/1":
                 return json.dumps({"permissions": {"project_access": {"access_level": 40}}}).encode()
             if path.endswith("/changes?access_raw_diffs=true"):
@@ -1352,6 +1461,8 @@ class GuardTests(unittest.TestCase):
 
     def test_already_reviewed_open_mr_skipped(self):
         def fake_api(base, token, platform, path, body=None, accept="application/json"):
+            if path == "/user":
+                return json.dumps({"username": "santosodb"}).encode()
             if path == "/projects/1":
                 return json.dumps({"permissions": {"project_access": {"access_level": 40}}}).encode()
             if "/notes" in path:

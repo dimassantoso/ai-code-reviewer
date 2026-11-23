@@ -14,12 +14,12 @@ import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 from urllib.parse import urlsplit
 
 MAX_BODY = 1_000_000
-MAX_DIFF = 100_000
+MAX_DIFF = int(os.getenv("MAX_DIFF", "100000"))  # chars per model call; larger diffs are chunked
 LOG = logging.getLogger("review")
 
 # Thread debate + review formatting. Empty BOT_USERNAME disables debate replies.
@@ -412,7 +412,35 @@ def strip_inline(review, posted=None):
     return re.sub(r"(?im)^.*verdict:.*$\n?", "", "\n\n".join(kept_blocks)).strip()
 
 
-def review_body(review, author, verdict, marker=True, posted=None):
+_whoami_cache = {}
+
+
+def reviewer_of(platform, base, token):
+    """The account that posts reviews (the token owner), cached per host.
+
+    Shown in every comment so readers can tell the MR author apart from the bot.
+    """
+    key = (platform, base)
+    if key in _whoami_cache:
+        return _whoami_cache[key]
+    try:
+        me = api_json(base, token, platform, "/user")
+        name = (me.get("username") or me.get("login") or "") if isinstance(me, dict) else ""
+    except (URLError, HTTPError, ValueError, OSError):
+        name = ""
+    _whoami_cache[key] = name
+    return name
+
+
+def footer_of(author, reviewer):
+    """Who opened the MR, who reviewed it — so nobody mistakes the bot for the author."""
+    parts = []
+    parts.append("\U0001f464 MR author: @%s" % author if author else "\U0001f464 MR author: unknown")
+    parts.append("\U0001f916 Reviewer: @%s (bot)" % reviewer if reviewer else "\U0001f916 Reviewer: Hermes Agent (bot)")
+    return "\n" + " \u00b7 ".join(parts)
+
+
+def review_body(review, author, verdict, marker=True, posted=None, reviewer=""):
     """Wrap model output in the posted comment: header, summary, marker, footer.
 
     `posted` is the set of (file, line) already posted inline; those findings are
@@ -427,6 +455,7 @@ def review_body(review, author, verdict, marker=True, posted=None):
     label = "Approved" if verdict == "APPROVE" else "Changes Requested"
     body = (f"{REVIEW_MARKER}\n" if marker else "") + header + summary + "\n\n---\n"
     body += f"\U0001f916 *Reviewed by Hermes Agent (ai-code-reviewer)*\nVerdict: {icon} {label}"
+    body += footer_of(author, reviewer)
     return body
 
 
@@ -441,6 +470,102 @@ def split_diff(raw):
         elif current is not None:
             current["diff"].append(line)
     return [{"new_path": f["new_path"], "diff": "\n".join(f["diff"])} for f in files if f["new_path"]]
+
+
+def hunks_of(label, diff, limit):
+    """Split one file's diff at hunk boundaries, keeping the file header.
+
+    `@@` headers carry absolute line numbers, so a piece still reports the real
+    file:line — inline comments stay valid after splitting.
+    """
+    header, hunks, current = [], [], None
+    for line in (diff or "").splitlines():
+        if line.startswith("@@ "):
+            if current is not None:
+                hunks.append(current)
+            current = [line]
+        elif current is None:
+            header.append(line)
+        else:
+            current.append(line)
+    if current is not None:
+        hunks.append(current)
+    blocks = []
+    for hunk in hunks:
+        blocks.extend(split_hunk(hunk, limit))
+    pieces, buf, size = [], [], 0
+    for block in blocks:
+        if buf and size + len(block) > limit:
+            pieces.append(label + "\n" + "\n".join(buf))
+            buf, size = [], 0
+        buf.append(block)
+        size += len(block) + 1
+    if buf:
+        pieces.append(label + "\n" + "\n".join(buf))
+    return pieces or [label + "\n" + (diff or "")]
+
+
+def split_hunk(hunk, limit):
+    """Break one hunk that is itself too big, keeping a usable @@ header on each part."""
+    block = "\n".join(hunk)
+    if len(block) <= limit:
+        return [block]
+    head, body = hunk[0], hunk[1:]
+    match = re.search(r"\+(\d+)", head)
+    new_start = int(match.group(1)) if match else 1
+    parts, buf, size = [], [], 0
+    for line in body:
+        if buf and size + len(line) > limit:
+            parts.append("@@ -%d +%d @@\n" % (new_start, new_start) + "\n".join(buf))
+            new_start += sum(1 for b in buf if b[:1] in ("+", " "))
+            buf, size = [], 0
+        buf.append(line)
+        size += len(line) + 1
+    if buf:
+        parts.append("@@ -%d +%d @@\n" % (new_start, new_start) + "\n".join(buf))
+    return parts
+
+
+def chunks_of(files, limit=None):
+    """Group changed files into diffs small enough for one model call."""
+    limit = limit or MAX_DIFF
+    chunk, size, out = [], 0, []
+    for f in files:
+        label = "--- %s" % (f.get("new_path") or f.get("old_path") or "?")
+        diff = f.get("diff") or ""
+        pieces = [label + "\n" + diff]
+        if len(pieces[0]) > limit:
+            pieces = hunks_of(label, diff, limit)
+        for piece in pieces:
+            if chunk and size + len(piece) > limit:
+                out.append("\n".join(chunk))
+                chunk, size = [], 0
+            chunk.append(piece)
+            size += len(piece)
+    if chunk:
+        out.append("\n".join(chunk))
+    return out or [""]
+
+
+def merge_reviews(reviews):
+    """One review from several: drop per-chunk verdicts, keep the strictest one."""
+    verdicts = [verdict_of(r) for r in reviews]
+    worst = "REQUEST_CHANGES" if "REQUEST_CHANGES" in verdicts else "APPROVE"
+    bodies = [re.sub(r"(?im)^[\s*]*verdict:.*$", "", r).strip() for r in reviews]
+    return "\n\n".join(b for b in bodies if b) + "\n\nVERDICT: " + worst
+
+
+def review_diff(header, diff, files):
+    """Review the whole diff, chunking when it exceeds one model call."""
+    if len(diff) <= MAX_DIFF:
+        return run_hermes(header + "\n\nDiff:\n" + diff)
+    pieces = chunks_of(files)
+    LOG.info("diff %d chars over MAX_DIFF %d: reviewing in %d chunk(s)", len(diff), MAX_DIFF, len(pieces))
+    reviews = []
+    for index, piece in enumerate(pieces, 1):
+        LOG.info("chunk %d/%d: %d chars (chunked review)", index, len(pieces), len(piece))
+        reviews.append(run_hermes(header + "\n\nDiff (part %d of %d):\n" % (index, len(pieces)) + piece))
+    return merge_reviews(reviews)
 
 
 def api_json(base, token, platform, path, body=None, accept="application/json"):
@@ -657,7 +782,9 @@ def debate(platform, payload, config, track=None):
     answer = re.sub(r"\n?VERDICT:.*$", "", run_hermes(query)).strip()
     if not answer:
         return skip("the model returned an empty reply")
-    body = f"{REVIEW_MARKER}\n### \U0001f4ac Reply to @{commenter}\n\n{answer}\n\n---\n\U0001f916 *Hermes Agent (ai-code-reviewer)*"
+    body = (f"{REVIEW_MARKER}\n### \U0001f4ac Reply to @{commenter}\n\n{answer}\n\n---\n"
+            f"\U0001f916 *Hermes Agent (ai-code-reviewer)*"
+            + footer_of(author_of(payload), reviewer_of(platform, base, token)))
     api(base, token, platform, reply_path, {"body": body})
     return True
 
@@ -668,7 +795,7 @@ def gh_can_approve(base, token, full_name):
     return bool((repo.get("permissions") or {}).get("push")) if isinstance(repo, dict) else False
 
 
-def gh_post_inline(base, token, full_name, number, review, files, author, event="COMMENT"):
+def gh_post_inline(base, token, full_name, number, review, files, author, event="COMMENT", reviewer=""):
     """Post parsed inline comments as one batched pull-request review with inline comments."""
     valid = {f["new_path"]: new_lines_of(f["diff"]) for f in files}
     findings, comments = parse_inline_comments(review), []
@@ -687,7 +814,7 @@ def gh_post_inline(base, token, full_name, number, review, files, author, event=
     if not comments:
         return 0
     api(base, token, "github", f"/repos/{full_name}/pulls/{number}/reviews",
-        {"body": review_body(review, author, verdict_of(review), marker=False), "event": event,
+        {"body": review_body(review, author, verdict_of(review), marker=False, reviewer=reviewer), "event": event,
          "comments": comments})
     return len(comments)
 
@@ -805,20 +932,18 @@ def process(platform, event, payload, config, track=None):
     if not job:
         return skip("nothing to review")
     diff = job["diff"]
-    # ponytail: reject oversized diffs rather than silently review incomplete code; add chunked reviews when needed.
-    if len(diff) > MAX_DIFF:
-        raise ValueError("diff too large for one review")
     key = review_key(platform, job)
     head = job.get("head") or ""
     with _reviewed_lock:
         if head and _reviewed.get(key) == head:
             LOG.info("%s unchanged since last review (head %s), skipping", key, head[:8])
             return skip("code unchanged since the last review (head %s)" % head[:8])
+    reviewer = reviewer_of(platform, job["base"], job["token"])
     draft = bool(job.get("draft"))
     if draft:
         LOG.info("target is a draft, reviewing but not approving")
     mark("reviewing", files=len(job["files"]))
-    review = run_hermes(job["header"] + "\n\nDiff:\n" + diff)
+    review = review_diff(job["header"], diff, job["files"])
     if superseded(platform, job, config):
         LOG.info("head moved during review, discarding stale result")
         return skip("new commits landed during the review, result discarded")
@@ -827,7 +952,7 @@ def process(platform, event, payload, config, track=None):
     if platform == "gitlab":
         inline = gl_post_inline(job["base"], job["token"], job["path"], review, job["files"], job["refs"])
         api(job["base"], job["token"], "gitlab", job["path"] + "/notes",
-            {"body": review_body(review, job["author"], verdict, posted=inline)})
+            {"body": review_body(review, job["author"], verdict, posted=inline, reviewer=reviewer)})
         LOG.info("MR reviewed: verdict=%s inline=%d access=%s", verdict, len(inline), job["level"])
         mark("posting", inline=len(inline))
         if verdict == "APPROVE" and not draft and job["level"] >= APPROVE_ACCESS_LEVEL:
@@ -837,10 +962,10 @@ def process(platform, event, payload, config, track=None):
                    and gh_can_approve(job["base"], job["token"], job["repo"]))
         event = "APPROVE" if approve else "COMMENT"
         inline = gh_post_inline(job["base"], job["token"], job["repo"], job["number"], review,
-                                job["files"], job["author"], event)
+                                job["files"], job["author"], event, reviewer)
         if not inline:  # inline review already carries the summary
             api(job["base"], job["token"], "github", f"/repos/{job['repo']}/pulls/{job['number']}/reviews",
-                {"body": review_body(review, job["author"], verdict, marker=False), "event": event})
+                {"body": review_body(review, job["author"], verdict, marker=False, reviewer=reviewer), "event": event})
         LOG.info("PR reviewed: verdict=%s event=%s inline=%d", verdict, event, inline)
         mark("posting", inline=inline)
     with _reviewed_lock:
