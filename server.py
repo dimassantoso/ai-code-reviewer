@@ -943,12 +943,15 @@ def url_of(platform, payload):
 
 
 def author_of(payload):
+    """Who opened the MR/PR — not who wrote the comment that triggered this run."""
     try:
         if payload.get("object_kind") == "note":
-            return (payload.get("user") or {}).get("username", "")
+            return ((payload.get("merge_request") or {}).get("author") or {}).get("username", "")
         if "object_attributes" in payload:
             return (payload["object_attributes"].get("author") or {}).get("username", "")
-        return ((payload.get("pull_request") or {}).get("user") or {}).get("login", "")
+        if "pull_request" in payload:
+            return ((payload.get("pull_request") or {}).get("user") or {}).get("login", "")
+        return ((payload.get("issue") or {}).get("user") or {}).get("login", "")
     except (KeyError, TypeError, AttributeError):
         return ""
 

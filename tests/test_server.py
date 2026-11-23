@@ -566,6 +566,9 @@ class SummaryCoverageTests(unittest.TestCase):
         self.assertIn("keep me", body)
 
 
+GL_CONFIG = {"token": "t", "secret": "s", "url": "https://gitlab.com"}
+
+
 class RemarkTests(unittest.TestCase):
     """A skipped row must say why, not just "skipped"."""
 
@@ -743,6 +746,31 @@ class TrackerTests(unittest.TestCase):
             fh.write('{"id": 2, "target": "ok"}\nnot json\n')
         snap = server.Tracker(self.path).snapshot()
         self.assertEqual([r["target"] for r in snap["history"]], ["ok"])
+
+
+class AuthorTests(unittest.TestCase):
+    """The Author column is the MR/PR creator, never the commenter."""
+
+    def test_gitlab_mr_author(self):
+        payload = {"object_attributes": {"author": {"username": "dimas"}}}
+        self.assertEqual(server.author_of(payload), "dimas")
+
+    def test_gitlab_note_reports_the_mr_author(self):
+        payload = {"object_kind": "note", "user": {"username": "reviewer"},
+                   "merge_request": {"iid": 1, "author": {"username": "dimas"}}}
+        self.assertEqual(server.author_of(payload), "dimas")
+
+    def test_github_pr_author(self):
+        payload = {"pull_request": {"user": {"login": "alice"}}}
+        self.assertEqual(server.author_of(payload), "alice")
+
+    def test_github_comment_reports_the_pr_author(self):
+        payload = {"action": "created", "comment": {"user": {"login": "reviewer"}},
+                   "issue": {"number": 1, "user": {"login": "alice"}}}
+        self.assertEqual(server.author_of(payload), "alice")
+
+    def test_missing_author_is_blank(self):
+        self.assertEqual(server.author_of({}), "")
 
 
 class LabelTests(unittest.TestCase):

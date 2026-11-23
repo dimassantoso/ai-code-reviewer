@@ -40,6 +40,7 @@
   .bar.done > i { background:var(--ok); }
   .empty { color:var(--dim); padding:14px; text-align:center; font-size:13px; }
   .err { color:var(--bad); font-size:12px; }
+  td.remark { color:var(--dim); font-size:12px; max-width:320px; }
   #stamp { float:right; color:var(--dim); font-size:11px; }
 </style>
 </head>
@@ -66,8 +67,8 @@
 
 <h2>History</h2>
 <table>
-  <thead><tr><th>When</th><th>Target</th><th>Author</th><th>Verdict</th><th>Inline</th><th>Duration</th><th>Status</th></tr></thead>
-  <tbody id="hist"><tr><td colspan="7" class="empty">no reviews yet</td></tr></tbody>
+  <thead><tr><th>When</th><th>Target</th><th>Author</th><th>Verdict</th><th>Inline</th><th>Duration</th><th>Status</th><th>Remark</th></tr></thead>
+  <tbody id="hist"><tr><td colspan="8" class="empty">no reviews yet</td></tr></tbody>
 </table>
 
 <script>
@@ -105,9 +106,9 @@ async function tick() {
       <td>${esc(h.author) || "–"}</td>
       <td>${h.verdict ? `<span class="pill ${esc(h.verdict)}">${esc(h.verdict)}</span>` : "–"}</td>
       <td class="num">${h.inline || 0}</td><td class="num">${secs(h.duration)}</td>
-      <td><span class="pill ${esc(h.status)}">${esc(h.status)}</span>
-      ${h.error ? `<div class="err">${esc(h.error)}</div>` : ""}</td></tr>`).join("")
-      : '<tr><td colspan="7" class="empty">no reviews yet</td></tr>';
+      <td><span class="pill ${esc(h.status)}">${esc(h.status)}</span></td>
+      <td class="remark">${esc(h.error || h.remark || "—")}</td></tr>`).join("")
+      : '<tr><td colspan="8" class="empty">no reviews yet</td></tr>';
   } catch (e) {
     document.getElementById("conn").textContent = "disconnected — retrying";
   }
