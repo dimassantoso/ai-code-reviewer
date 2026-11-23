@@ -362,6 +362,106 @@ class AllowlistTests(unittest.TestCase):
             self.assertTrue(server.repo_enabled("github", payload))
 
 
+class ReviewOnlyOpenTests(unittest.TestCase):
+    """Only open, non-draft MRs are reviewed. Draft -> ready triggers a review."""
+
+    GL_CONFIG = {"token": "gl", "secret": SECRET, "url": "https://gl.example"}
+
+    def setUp(self):
+        server._reviewed.clear()
+        server._seen.clear()
+
+    def payload(self, action="open", state="opened", draft=False, title="feat: x"):
+        return {"object_kind": "merge_request", "project": {"id": 1, "path_with_namespace": "acme/w"},
+                "object_attributes": {"iid": 2, "action": action, "state": state,
+                                      "draft": draft, "title": title}}
+
+    def run_with(self, payload, event="Merge Request Hook", job=None):
+        seen = {}
+        job = job or {"base": "b", "token": "t", "path": "/p", "files": [{"new_path": "a.py", "diff": "@@ -0,0 +1 @@\n+x"}],
+                      "author": "alice", "header": "h", "level": 40, "draft": False,
+                      "refs": {}, "head": "sha1", "diff": "@@ -0,0 +1 @@\n+x"}
+        job["draft"] = bool(payload["object_attributes"].get("draft")) or job["draft"]  # as collected
+        with patch.object(server, "collect_gitlab", return_value=job), \
+                patch.object(server, "run_hermes", return_value="ok\nVERDICT: APPROVE") as hermes, \
+                patch.object(server, "api"), patch.object(server, "reviewer_of", return_value="bot"), \
+                patch.object(server, "gl_post_inline", return_value=set()), \
+                patch.object(server, "superseded", return_value=False), \
+                patch.object(server, "gl_approve", return_value=True):
+            result = server.process("gitlab", event, payload, self.GL_CONFIG,
+                                    lambda stage, **kw: seen.update(kw))
+        return result, seen, hermes
+
+    def test_open_mr_is_reviewed(self):
+        result, _, hermes = self.run_with(self.payload(action="open"))
+        self.assertTrue(result)
+        hermes.assert_called_once()
+
+    def test_closed_mr_is_skipped(self):
+        result, seen, hermes = self.run_with(self.payload(action="close", state="closed"))
+        self.assertFalse(result)
+        hermes.assert_not_called()
+        self.assertIn("does not trigger a review", seen["remark"])
+
+    def test_merged_mr_is_skipped(self):
+        result, seen, hermes = self.run_with(self.payload(action="merge", state="merged"))
+        self.assertFalse(result)
+        hermes.assert_not_called()
+        self.assertIn("does not trigger a review", seen["remark"])
+
+    def test_update_on_closed_mr_is_skipped(self):
+        result, seen, hermes = self.run_with(self.payload(action="update", state="closed"))
+        self.assertFalse(result)
+        hermes.assert_not_called()
+        self.assertIn("only open merge requests", seen["remark"])
+
+    def test_update_on_merged_mr_is_skipped(self):
+        result, seen, hermes = self.run_with(self.payload(action="update", state="merged"))
+        self.assertFalse(result)
+        hermes.assert_not_called()
+        self.assertIn("only open merge requests", seen["remark"])
+
+    def test_draft_mr_is_skipped(self):
+        result, seen, hermes = self.run_with(self.payload(action="open", draft=True))
+        self.assertFalse(result)
+        hermes.assert_not_called()
+        self.assertIn("draft", seen["remark"])
+
+    def test_wip_title_counts_as_draft(self):
+        job = {"base": "b", "token": "t", "path": "/p", "files": [{"new_path": "a.py", "diff": "@@ -0,0 +1 @@\n+x"}],
+               "author": "alice", "header": "h", "level": 40, "draft": True,
+               "refs": {}, "head": "sha1", "diff": "@@ -0,0 +1 @@\n+x"}
+        result, seen, hermes = self.run_with(self.payload(action="open"), job=job)
+        self.assertFalse(result)
+        hermes.assert_not_called()
+        self.assertIn("draft", seen["remark"])
+
+    def test_marking_ready_is_an_update_and_triggers_a_review(self):
+        payload = self.payload(action="update", state="opened", draft=False)
+        self.assertTrue(server.triggers_review("gitlab", "Merge Request Hook", payload))
+        result, _, hermes = self.run_with(payload)
+        self.assertTrue(result)
+        hermes.assert_called_once()
+
+    def test_github_ready_for_review_triggers(self):
+        self.assertTrue(server.triggers_review("github", "pull_request", {"action": "ready_for_review"}))
+
+    def test_github_merged_pr_is_skipped(self):
+        job = {"base": "b", "token": "t", "repo": "acme/w", "number": 1,
+               "files": [{"new_path": "a.py", "diff": "@@ -0,0 +1 @@\n+x"}], "author": "alice",
+               "header": "h", "draft": False, "state": "closed", "merged": True,
+               "head": "sha1", "diff": "@@ -0,0 +1 @@\n+x"}
+        seen = {}
+        with patch.object(server, "collect_github", return_value=job), \
+                patch.object(server, "run_hermes") as hermes:
+            result = server.process("github", "pull_request", {"action": "opened", "number": 1},
+                                    {"token": "gh", "secret": SECRET, "url": "https://api.github.com"},
+                                    lambda stage, **kw: seen.update(kw))
+        self.assertFalse(result)
+        hermes.assert_not_called()
+        self.assertIn("merged", seen["remark"])
+
+
 class TriggerFilterTests(unittest.TestCase):
     """Non-review webhooks are acknowledged and dropped: no dashboard row."""
 
@@ -372,6 +472,18 @@ class TriggerFilterTests(unittest.TestCase):
         for action in ("open", "update", "reopen"):
             payload = {"object_kind": "merge_request", "object_attributes": {"action": action, "iid": 1}}
             self.assertTrue(server.triggers_review("gitlab", "Merge Request Hook", payload), action)
+
+    def test_update_on_a_closed_or_merged_mr_creates_no_row(self):
+        for state in ("closed", "merged"):
+            with self.subTest(state=state):
+                payload = {"object_kind": "merge_request",
+                           "object_attributes": {"action": "update", "state": state, "iid": 1}}
+                self.assertFalse(server.triggers_review("gitlab", "Merge Request Hook", payload))
+
+    def test_update_on_an_open_mr_triggers(self):
+        payload = {"object_kind": "merge_request",
+                   "object_attributes": {"action": "update", "state": "opened", "iid": 1}}
+        self.assertTrue(server.triggers_review("gitlab", "Merge Request Hook", payload))
 
     def test_closed_merge_request_is_filtered_out(self):
         payload = {"object_kind": "merge_request", "object_attributes": {"action": "close", "iid": 1}}
@@ -488,9 +600,10 @@ class GitHubFlowTests(IsolatedCase):
             return b"{}"
 
         with patch.object(server, "api", side_effect=fake_api), \
-                patch.object(server, "run_hermes", return_value="ok\nVERDICT: APPROVE"):
-            self.assertTrue(server.process("github", "pull_request", self.payload(), self.CONFIG))
-        self.assertEqual(posts[0][1]["event"], "COMMENT")
+                patch.object(server, "run_hermes", return_value="ok\nVERDICT: APPROVE") as hermes:
+            self.assertFalse(server.process("github", "pull_request", self.payload(), self.CONFIG))
+        hermes.assert_not_called()
+        self.assertEqual(posts, [])
 
     def test_inline_cap_respected(self):
         posts = []
@@ -526,8 +639,16 @@ class GitHubFlowTests(IsolatedCase):
         api.assert_not_called()
 
     def test_empty_diff_skips_review(self):
-        with patch.object(server, "api", return_value=b"  \n"), patch.object(server, "run_hermes") as hermes:
-            self.assertFalse(server.process("github", "pull_request", self.payload(), self.CONFIG))
+        original = self.payload()
+
+        def fake_api(base, token, platform, path, body=None, accept="application/json"):
+            if accept.endswith("diff"):
+                return b"  \n"
+            return json.dumps({"title": "t", "state": "open", "merged": False, "user": {"login": "alice"},
+                               "head": {"ref": "f"}, "base": {"ref": "main"}}).encode()
+
+        with patch.object(server, "api", side_effect=fake_api), patch.object(server, "run_hermes") as hermes:
+            self.assertFalse(server.process("github", "pull_request", original, self.CONFIG))
         hermes.assert_not_called()
 
 
@@ -1398,7 +1519,7 @@ class StaleReviewTests(unittest.TestCase):
 class DraftTests(unittest.TestCase):
     HARMLESS_GL = {"token": "gl", "secret": SECRET, "url": "https://gitlab.example.com"}
 
-    def test_draft_mr_is_reviewed_but_not_approved(self):
+    def test_draft_mr_is_not_reviewed(self):
         def fake_api(base, token, platform, path, body=None, accept="application/json"):
             if path == "/user":
                 return json.dumps({"username": "santosodb"}).encode()
@@ -1408,14 +1529,14 @@ class DraftTests(unittest.TestCase):
                 return json.dumps({"changes": [{"new_path": "a.py", "diff": "@@ -0,0 +1 @@\n+x"}],
                                    "overflow": False}).encode()
             if path.endswith("/approvals"):
-                raise AssertionError("must not approve a draft")
+                raise AssertionError("a draft must not be reviewed at all")
             if body is not None:
                 return b'{"id": 1}'
             return json.dumps({"author": {"username": "alice"}, "diff_refs": {}}).encode()
 
         with patch.object(server, "api", side_effect=fake_api), \
                 patch.object(server, "run_hermes", return_value="fine\nVERDICT: APPROVE"):
-            self.assertTrue(server.process("gitlab", "Merge Request Hook", {
+            self.assertFalse(server.process("gitlab", "Merge Request Hook", {
                 "object_kind": "merge_request", "project": {"id": 1},
                 "object_attributes": {"iid": 2, "action": "update", "title": "Draft: wip"}},
                 self.HARMLESS_GL))

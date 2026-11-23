@@ -899,6 +899,7 @@ def collect_github(payload, config):
               + REVIEW_FORMAT)
     return {"base": base, "token": token, "repo": full_name, "number": number, "author": author,
             "header": header, "files": split_diff(raw), "diff": raw, "draft": bool(pr.get("draft")),
+            "state": (pr.get("state") or "").lower(), "merged": bool(pr.get("merged")),
             "head": (pr.get("head") or {}).get("sha") or ""}
 
 
@@ -922,20 +923,26 @@ def process(platform, event, payload, config, track=None):
         attrs = payload.get("object_attributes")
         if event != "Merge Request Hook" or payload.get("object_kind") != "merge_request":
             return skip("not a merge request event (%s)" % (event or "no event header"))
-        if not isinstance(attrs, dict) or attrs.get("action") not in ("open", "update", "reopen"):
+        if not isinstance(attrs, dict) or attrs.get("action") not in REVIEW_ACTIONS:
             action = attrs.get("action") if isinstance(attrs, dict) else "?"
             return skip("MR action %r does not trigger a review" % action)
+        state = (attrs.get("state") or "").lower()
+        if state and state != "opened":
+            return skip("MR is %s; only open merge requests are reviewed" % state)
         job = collect_gitlab(payload, config)
     else:
         if event != "pull_request":
             return skip("not a pull request event (%s)" % (event or "no event header"))
-        if payload.get("action") not in ("opened", "synchronize", "reopened"):
+        if payload.get("action") not in PR_ACTIONS:
             return skip("PR action %r does not trigger a review" % payload.get("action"))
         job = collect_github(payload, config)
     if isinstance(job, str):  # collector refused: it returns the reason
         return skip(job)
     if not job:
         return skip("nothing to review")
+    if platform == "github" and (job.get("merged") or (job.get("state") or "open") != "open"):
+        return skip("PR is %s; only open pull requests are reviewed"
+                    % ("merged" if job.get("merged") else job.get("state") or "not open"))
     diff = job["diff"]
     key = review_key(platform, job)
     head = job.get("head") or ""
@@ -943,10 +950,10 @@ def process(platform, event, payload, config, track=None):
         if head and _reviewed.get(key) == head:
             LOG.info("%s unchanged since last review (head %s), skipping", key, head[:8])
             return skip("code unchanged since the last review (head %s)" % head[:8])
+    if job.get("draft"):
+        return skip("%s is a draft; review runs when it is marked ready"
+                    % ("MR" if platform == "gitlab" else "PR"))
     reviewer = reviewer_of(platform, job["base"], job["token"])
-    draft = bool(job.get("draft"))
-    if draft:
-        LOG.info("target is a draft, reviewing but not approving")
     mark("reviewing", files=len(job["files"]))
     review = review_diff(job["header"], diff, job["files"])
     if superseded(platform, job, config):
@@ -960,11 +967,10 @@ def process(platform, event, payload, config, track=None):
             {"body": review_body(review, job["author"], verdict, posted=inline, reviewer=reviewer)})
         LOG.info("MR reviewed: verdict=%s inline=%d access=%s", verdict, len(inline), job["level"])
         mark("posting", inline=len(inline))
-        if verdict == "APPROVE" and not draft and job["level"] >= APPROVE_ACCESS_LEVEL:
+        if verdict == "APPROVE" and job["level"] >= APPROVE_ACCESS_LEVEL:
             LOG.info("MR approved: %s", gl_approve(job["base"], job["token"], job["path"], job["author"]))
     else:
-        approve = (verdict == "APPROVE" and not draft
-                   and gh_can_approve(job["base"], job["token"], job["repo"]))
+        approve = verdict == "APPROVE" and gh_can_approve(job["base"], job["token"], job["repo"])
         event = "APPROVE" if approve else "COMMENT"
         inline = gh_post_inline(job["base"], job["token"], job["repo"], job["number"], review,
                                 job["files"], job["author"], event, reviewer)
@@ -1117,7 +1123,7 @@ def author_of(payload):
 
 
 REVIEW_ACTIONS = {"open", "update", "reopen"}
-PR_ACTIONS = {"opened", "synchronize", "reopened"}
+PR_ACTIONS = {"opened", "synchronize", "reopened", "ready_for_review"}
 
 
 def triggers_review(platform, event, payload):
@@ -1133,10 +1139,11 @@ def triggers_review(platform, event, payload):
             return True
         if platform == "gitlab":
             attrs = payload.get("object_attributes")
-            return (event == "Merge Request Hook"
-                    and payload.get("object_kind") == "merge_request"
-                    and isinstance(attrs, dict)
-                    and attrs.get("action") in REVIEW_ACTIONS)
+            if (event != "Merge Request Hook" or payload.get("object_kind") != "merge_request"
+                    or not isinstance(attrs, dict) or attrs.get("action") not in REVIEW_ACTIONS):
+                return False
+            state = (attrs.get("state") or "").lower()
+            return not state or state == "opened"  # closed/merged are ignored, not recorded
         return event == "pull_request" and payload.get("action") in PR_ACTIONS
     except (AttributeError, TypeError):
         return False
