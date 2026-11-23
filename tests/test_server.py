@@ -623,7 +623,7 @@ class DashboardTests(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.old = server._tracker
         server._tracker = server.Tracker(os.path.join(self.tmp, "r.jsonl"))
-        server.DASHBOARD_TOKEN = ""
+        server.DASHBOARD_USER, server.DASHBOARD_PASSWORD = "admin", ""
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
         self.base = "http://127.0.0.1:%d" % self.httpd.server_address[1]
@@ -632,11 +632,14 @@ class DashboardTests(unittest.TestCase):
         self.httpd.shutdown()
         self.httpd.server_close()
         server._tracker = self.old
-        server.DASHBOARD_TOKEN = ""
+        server.DASHBOARD_USER, server.DASHBOARD_PASSWORD = "admin", ""
 
-    def get(self, path):
+    def get(self, path, creds=None):
+        request = Request(self.base + path)
+        if creds:
+            request.add_header("Authorization", "Basic " + base64.b64encode(creds.encode()).decode())
         try:
-            with urlopen(self.base + path, timeout=5) as r:
+            with urlopen(request, timeout=5) as r:
                 return r.status, r.read().decode()
         except HTTPError as error:
             return error.code, error.read().decode()
@@ -652,15 +655,27 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(set(data), {"live", "history", "stats"})
         self.assertEqual(data["stats"]["workers"], server.MAX_WORKERS)
 
-    def test_token_gate_when_configured(self):
-        server.DASHBOARD_TOKEN = "s3cret"
-        self.assertEqual(self.get("/api/reviews")[0], 403)
-        self.assertEqual(self.get("/api/reviews?token=wrong")[0], 403)
-        self.assertEqual(self.get("/dashboard")[0], 403)
-        self.assertEqual(self.get("/api/reviews?token=s3cret")[0], 200)
+    def test_basic_auth_gate_when_configured(self):
+        server.DASHBOARD_USER, server.DASHBOARD_PASSWORD = "admin", "s3cret"
+        self.assertEqual(self.get("/api/reviews")[0], 401)
+        self.assertEqual(self.get("/dashboard")[0], 401)
+        self.assertEqual(self.get("/api/reviews", "admin:wrong")[0], 401)
+        self.assertEqual(self.get("/api/reviews", "bob:s3cret")[0], 401)
+        self.assertEqual(self.get("/api/reviews", "admin:s3cret")[0], 200)
+        self.assertEqual(self.get("/dashboard", "admin:s3cret")[0], 200)
 
-    def test_health_needs_no_token(self):
-        server.DASHBOARD_TOKEN = "s3cret"
+    def test_401_advertises_basic_realm(self):
+        server.DASHBOARD_PASSWORD = "s3cret"
+        try:
+            urlopen(self.base + "/dashboard", timeout=5)
+        except HTTPError as error:
+            self.assertEqual(error.code, 401)
+            self.assertIn("Basic realm=", error.headers["WWW-Authenticate"])
+        else:
+            self.fail("expected 401")
+
+    def test_health_needs_no_login(self):
+        server.DASHBOARD_PASSWORD = "s3cret"
         self.assertEqual(self.get("/health")[0], 200)
 
 

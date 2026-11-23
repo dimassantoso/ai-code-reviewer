@@ -16,7 +16,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import urlsplit
 
 MAX_BODY = 1_000_000
 MAX_DIFF = 100_000
@@ -30,7 +30,8 @@ APPROVE_ACCESS_LEVEL = int(os.getenv("APPROVE_ACCESS_LEVEL", "40"))  # 40=Mainta
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "30"))
 MAX_DEBATE_DIFF = 20_000  # diff context handed to a debate reply
 MAX_INLINE = int(os.getenv("MAX_INLINE", "20"))  # inline comments posted per review
-DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "")  # unset = dashboard is open
+DASHBOARD_USER = os.getenv("DASHBOARD_USER", "admin")
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")  # blank = dashboard is open
 
 REVIEW_FORMAT = (
     "When you find issues, list them under a section titled '### Inline Comments', one per line, format:\n"
@@ -906,42 +907,60 @@ def release(platform, raw):
 class Handler(BaseHTTPRequestHandler):
     timeout = 15  # socket read/idle timeout; slow clients cannot pin a thread
 
+    extra_headers = ()
+
     def respond(self, status, message):
         body = message.encode()
         self.send_response(status)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        for key, value in self.extra_headers:
+            self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self):
         self.extra_headers = []
-        path, _, query = self.path.partition("?")
+        path = self.path.partition("?")[0]
         if path == "/health":
             return self.respond(200, "ok")
         if path in ("/", "/dashboard"):
-            if not self.authorized(query):
-                return self.respond(403, "dashboard token required")
+            if not self.authorized():
+                return self.unauthorized()
             return self.reply(200, DASHBOARD_HTML, "text/html; charset=utf-8")
         if path == "/api/reviews":
-            if not self.authorized(query):
-                return self.respond(403, "dashboard token required")
+            if not self.authorized():
+                return self.unauthorized()
             data = _tracker.snapshot()
             data["stats"]["queued"] = _jobs.qsize()
             data["stats"]["workers"] = MAX_WORKERS
             return self.reply(200, json.dumps(data), "application/json")
         self.respond(404, "not found")
 
-    def authorized(self, query):
-        """DASHBOARD_TOKEN unset = open; set = require it as ?token= (kept in a cookie)."""
-        if not DASHBOARD_TOKEN:
+    def authorized(self):
+        """HTTP Basic auth: the browser's own login prompt, no token in the URL.
+
+        Blank DASHBOARD_PASSWORD leaves the dashboard open, which is only sane
+        behind Tailscale or Cloudflare Access.
+        """
+        if not DASHBOARD_PASSWORD:
             return True
-        given = parse_qs(query).get("token", [""])[0]
-        cookie = re.search(r"(?:^|;\s*)dash=([^;]+)", self.headers.get("Cookie", ""))
-        if given and hmac.compare_digest(given, DASHBOARD_TOKEN):
-            self.extra_headers.append(("Set-Cookie", "dash=%s; Path=/; HttpOnly; SameSite=Strict" % DASHBOARD_TOKEN))
-            return True
-        return bool(cookie and hmac.compare_digest(cookie.group(1), DASHBOARD_TOKEN))
+        header = self.headers.get("Authorization", "")
+        if not header.startswith("Basic "):
+            return False
+        try:
+            user, _, password = base64.b64decode(header[6:], validate=True).decode().partition(":")
+        except (binascii.Error, UnicodeError):
+            return False
+        ok_user = hmac.compare_digest(user, DASHBOARD_USER)
+        ok_pass = hmac.compare_digest(password, DASHBOARD_PASSWORD)
+        if not (ok_user and ok_pass):
+            time.sleep(0.5)  # ponytail: fixed delay, not a real lockout; Zero Trust is the gate
+        return ok_user and ok_pass
+
+    def unauthorized(self):
+        self.extra_headers.append(("WWW-Authenticate", 'Basic realm="AI Code Reviewer", charset="UTF-8"'))
+        self.respond(401, "login required")
 
     def reply(self, status, text, ctype):
         body = text.encode()

@@ -53,7 +53,7 @@ Copy `.env.example` to `.env` and fill in at least one platform token and its we
 | `COOLDOWN_SECONDS` | Per-user per-thread debate cooldown. Default `30`. |
 | `MAX_INLINE` | Inline comments posted per review. Default `20`. |
 | `MAX_DEBATE_DIFF` | Diff characters handed to a debate reply. Default `20000`. |
-| `DASHBOARD_TOKEN` | Optional. When set, `/dashboard` and `/api/reviews` require `?token=…`. Unset leaves them open. |
+| `DASHBOARD_USER`, `DASHBOARD_PASSWORD` | HTTP Basic auth for `/dashboard` and `/api/reviews`. Blank password leaves them open; the browser shows its own login prompt, so no token in the URL. |
 | `REVIEW_STORE` | Optional JSONL path for review history. Unset keeps history in memory only (lost on restart). |
 | `REVIEW_EST_S` | Expected review duration, used to scale the progress bar. Default `60`. |
 
@@ -108,7 +108,7 @@ Compose publishes only `127.0.0.1:9877` and forces the container listener to `0.
 - GitLab: configure `https://<host>/gl-review` for merge request events. The server accepts `X-Gitlab-Token` or Standard Webhooks signing headers; `whsec_` secrets must contain valid base64.
 - GitHub: configure `https://<host>/gh-review` for pull request events and JSON payloads. The server verifies `X-Hub-Signature-256`.
 - `GET /health` returns `200 ok`. A disabled platform returns `404`; an invalid signature returns `403`.
-- `GET /dashboard` is a live review dashboard; `GET /api/reviews` is the same data as JSON. Both are read-only and need `?token=` only when `DASHBOARD_TOKEN` is set.
+- `GET /dashboard` is a live review dashboard; `GET /api/reviews` is the same data as JSON. Both are read-only and ask for HTTP Basic login when `DASHBOARD_PASSWORD` is set.
 - Valid requests are acknowledged with `202 accepted` before background processing. This is not proof a review was posted; inspect logs and the MR/PR. Duplicate payloads are suppressed in memory for five minutes, not durably across restarts.
 - GitLab open/update/reopen and GitHub opened/synchronize/reopened events trigger review. Both platforms get inline comments on lines that exist in the diff (GitLab as discussions, GitHub as a batched review) plus a summary; `MAX_INLINE` caps them per review (default 20).
 - Auto-approve: verdict `APPROVE`, target is not a draft, author is not the bot, and the token user may approve. GitLab additionally requires access ≥ `APPROVE_ACCESS_LEVEL` and checks `user_can_approve`; GitHub requires push permission on the repo.
