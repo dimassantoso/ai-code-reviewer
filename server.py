@@ -169,7 +169,8 @@ class Tracker:
             rec.update(fields)
             rec["status"] = status
             rec["stage"] = status
-            rec["duration"] = round(time.time() - rec["started"], 1)
+            if not rec.get("duration"):  # explicit duration wins (seeded history)
+                rec["duration"] = round(time.time() - rec["started"], 1)
             self.live.pop(rec["id"], None)
             self.done.appendleft(dict(rec))
             if self.path:

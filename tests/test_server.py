@@ -582,6 +582,17 @@ class TrackerTests(unittest.TestCase):
         self.assertEqual(again.snapshot()["stats"]["total"], 1)
         self.assertEqual(again.seq, rec["id"])
 
+    def test_duration_is_measured_not_zero(self):
+        rec = self.t.begin("gitlab", "g/p!9")
+        time.sleep(0.2)
+        self.t.finish(rec)
+        self.assertGreater(self.t.snapshot()["history"][0]["duration"], 0)
+
+    def test_explicit_duration_is_kept(self):
+        rec = self.t.begin("gitlab", "g/p!10")
+        self.t.finish(rec, duration=42.0)
+        self.assertEqual(self.t.snapshot()["history"][0]["duration"], 42.0)
+
     def test_failure_is_recorded_with_reason(self):
         rec = self.t.begin("gitlab", "g/p!3")
         self.t.finish(rec, "failed", error="diff too large for one review")
