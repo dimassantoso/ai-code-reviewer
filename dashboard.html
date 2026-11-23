@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Code Reviewer</title>
+<style>
+  :root { --bg:#0e1117; --panel:#161b22; --line:#232a34; --fg:#e6edf3; --dim:#8b949e;
+          --ok:#3fb950; --warn:#d29922; --bad:#f85149; --accent:#58a6ff; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:20px; background:var(--bg); color:var(--fg);
+         font:14px/1.5 ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  h1 { font-size:18px; margin:0 0 2px; font-weight:600; }
+  .sub { color:var(--dim); font-size:12px; margin-bottom:18px; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; margin-bottom:20px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px 14px; }
+  .card .k { color:var(--dim); font-size:11px; text-transform:uppercase; letter-spacing:.04em; }
+  .card .v { font-size:22px; font-weight:600; margin-top:4px; font-variant-numeric:tabular-nums; }
+  .v.ok { color:var(--ok); } .v.bad { color:var(--bad); } .v.blue { color:var(--accent); }
+  h2 { font-size:13px; text-transform:uppercase; letter-spacing:.05em; color:var(--dim);
+       margin:22px 0 8px; font-weight:600; }
+  table { width:100%; border-collapse:collapse; background:var(--panel);
+          border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  th, td { text-align:left; padding:8px 12px; border-bottom:1px solid var(--line); font-size:13px; }
+  th { color:var(--dim); font-weight:500; font-size:11px; text-transform:uppercase; letter-spacing:.04em; }
+  tr:last-child td { border-bottom:none; }
+  td.num { font-variant-numeric:tabular-nums; }
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
+  .pill { display:inline-block; padding:1px 7px; border-radius:10px; font-size:11px; font-weight:600; }
+  .pill.done { background:rgba(63,185,80,.15); color:var(--ok); }
+  .pill.failed { background:rgba(248,81,73,.15); color:var(--bad); }
+  .pill.skipped { background:rgba(139,148,158,.15); color:var(--dim); }
+  .pill.running { background:rgba(88,166,255,.15); color:var(--accent); }
+  .pill.APPROVE { background:rgba(63,185,80,.15); color:var(--ok); }
+  .pill.REQUEST_CHANGES { background:rgba(248,81,73,.15); color:var(--bad); }
+  .bar { height:6px; background:var(--line); border-radius:3px; overflow:hidden; min-width:90px; }
+  .bar > i { display:block; height:100%; background:var(--accent); transition:width .4s ease; }
+  .bar.done > i { background:var(--ok); }
+  .empty { color:var(--dim); padding:14px; text-align:center; font-size:13px; }
+  .err { color:var(--bad); font-size:12px; }
+  #stamp { float:right; color:var(--dim); font-size:11px; }
+</style>
+</head>
+<body>
+<h1>AI Code Reviewer <span id="stamp"></span></h1>
+<div class="sub" id="conn">connecting…</div>
+
+<div class="cards">
+  <div class="card"><div class="k">Reviews</div><div class="v" id="s-total">–</div></div>
+  <div class="card"><div class="k">Today</div><div class="v" id="s-today">–</div></div>
+  <div class="card"><div class="k">Running</div><div class="v blue" id="s-running">–</div></div>
+  <div class="card"><div class="k">Queued</div><div class="v" id="s-queued">–</div></div>
+  <div class="card"><div class="k">Avg time</div><div class="v" id="s-avg">–</div></div>
+  <div class="card"><div class="k">p95</div><div class="v" id="s-p95">–</div></div>
+  <div class="card"><div class="k">Approved</div><div class="v ok" id="s-approve">–</div></div>
+  <div class="card"><div class="k">Failed</div><div class="v bad" id="s-failed">–</div></div>
+</div>
+
+<h2>In progress</h2>
+<table>
+  <thead><tr><th>Target</th><th>Platform</th><th>Stage</th><th>Elapsed</th><th style="width:24%">Progress</th></tr></thead>
+  <tbody id="live"><tr><td colspan="5" class="empty">idle</td></tr></tbody>
+</table>
+
+<h2>History</h2>
+<table>
+  <thead><tr><th>When</th><th>Target</th><th>Author</th><th>Verdict</th><th>Inline</th><th>Duration</th><th>Status</th></tr></thead>
+  <tbody id="hist"><tr><td colspan="7" class="empty">no reviews yet</td></tr></tbody>
+</table>
+
+<script>
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const secs = n => n >= 60 ? Math.floor(n / 60) + "m " + Math.round(n % 60) + "s" : (n || 0).toFixed(1) + "s";
+const when = t => new Date(t * 1000).toLocaleString(undefined, {month:"short", day:"numeric", hour:"2-digit", minute:"2-digit"});
+const token = new URLSearchParams(location.search).get("token");
+
+async function tick() {
+  try {
+    const r = await fetch("/api/reviews" + (token ? "?token=" + encodeURIComponent(token) : ""), {cache:"no-store"});
+    if (r.status === 403) { document.getElementById("conn").textContent = "403 — add ?token=… to the URL"; return; }
+    const d = await r.json(), s = d.stats;
+    document.getElementById("conn").textContent =
+      s.workers + " workers · " + s.inline + " inline comments posted · auto-refresh 2s";
+    document.getElementById("stamp").textContent = new Date().toLocaleTimeString();
+    const set = (id, v, cls) => { const e = document.getElementById(id); e.textContent = v; if (cls) e.className = "v " + cls; };
+    set("s-total", s.total); set("s-today", s.today); set("s-running", s.running, "blue");
+    set("s-queued", s.queued); set("s-avg", s.avg ? secs(s.avg) : "–");
+    set("s-p95", s.p95 ? secs(s.p95) : "–"); set("s-approve", s.verdicts.APPROVE || 0, "ok");
+    set("s-failed", s.failed, "bad");
+
+    document.getElementById("live").innerHTML = d.live.length ? d.live.map(j => `<tr>
+      <td class="mono">${esc(j.target)}</td><td>${esc(j.platform)}</td><td>${esc(j.stage)}</td>
+      <td class="num">${secs(j.elapsed)}</td>
+      <td><div class="bar"><i style="width:${j.pct}%"></i></div></td></tr>`).join("")
+      : '<tr><td colspan="5" class="empty">idle</td></tr>';
+
+    document.getElementById("hist").innerHTML = d.history.length ? d.history.slice(0, 50).map(h => `<tr>
+      <td class="num">${when(h.started)}</td><td class="mono">${esc(h.target)}</td>
+      <td>${esc(h.author) || "–"}</td>
+      <td>${h.verdict ? `<span class="pill ${esc(h.verdict)}">${esc(h.verdict)}</span>` : "–"}</td>
+      <td class="num">${h.inline || 0}</td><td class="num">${secs(h.duration)}</td>
+      <td><span class="pill ${esc(h.status)}">${esc(h.status)}</span>
+      ${h.error ? `<div class="err">${esc(h.error)}</div>` : ""}</td></tr>`).join("")
+      : '<tr><td colspan="7" class="empty">no reviews yet</td></tr>';
+  } catch (e) {
+    document.getElementById("conn").textContent = "disconnected — retrying";
+  }
+}
+tick(); setInterval(tick, 2000);
+</script>
+</body>
+</html>

@@ -2,6 +2,7 @@
 """GitLab/GitHub webhook reviews. Configuration is read from environment at startup."""
 import base64
 import binascii
+import collections
 import hashlib
 import hmac
 import json
@@ -15,7 +16,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 MAX_BODY = 1_000_000
 MAX_DIFF = 100_000
@@ -29,6 +30,7 @@ APPROVE_ACCESS_LEVEL = int(os.getenv("APPROVE_ACCESS_LEVEL", "40"))  # 40=Mainta
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "30"))
 MAX_DEBATE_DIFF = 20_000  # diff context handed to a debate reply
 MAX_INLINE = int(os.getenv("MAX_INLINE", "20"))  # inline comments posted per review
+DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN", "")  # unset = dashboard is open
 
 REVIEW_FORMAT = (
     "When you find issues, list them under a section titled '### Inline Comments', one per line, format:\n"
@@ -115,6 +117,120 @@ def positive(value):
 def bot_mentioned(text):
     """Whole-username match so @santosodbot does not trigger @santosodb."""
     return bool(BOT_USERNAME and re.search(rf"(?<![\w-])@{re.escape(BOT_USERNAME)}(?![\w-])", text, re.I))
+
+
+class Tracker:
+    """Live jobs in memory plus append-only JSONL history. Feeds the dashboard."""
+
+    def __init__(self, path="", limit=500, est=None):
+        self.path = path
+        self.est = est or float(os.getenv("REVIEW_EST_S", "60"))
+        self.lock = threading.Lock()
+        self.live = {}
+        self.done = collections.deque(maxlen=limit)
+        self.seq = 0
+        self._load()
+
+    def _load(self):
+        if not self.path or not os.path.exists(self.path):
+            return
+        try:
+            with open(self.path, encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(rec, dict) and "id" in rec:
+                        self.done.appendleft(rec)
+                        self.seq = max(self.seq, int(rec["id"]))
+        except OSError:
+            LOG.warning("review store %s unreadable, starting empty", self.path)
+
+    def begin(self, platform, target, author="", files=0):
+        with self.lock:
+            self.seq += 1
+            rec = {"id": self.seq, "platform": platform, "target": target, "author": author,
+                   "status": "running", "stage": "queued", "started": time.time(),
+                   "duration": 0.0, "verdict": "", "inline": 0, "files": files, "error": ""}
+            self.live[self.seq] = rec
+            return rec
+
+    def stage(self, rec, name):
+        if rec is not None:
+            with self.lock:
+                rec["stage"] = name
+
+    def finish(self, rec, status="done", **fields):
+        """Move a job out of the live map into history, and persist it."""
+        if rec is None:
+            return
+        with self.lock:
+            rec.update(fields)
+            rec["status"] = status
+            rec["stage"] = status
+            rec["duration"] = round(time.time() - rec["started"], 1)
+            self.live.pop(rec["id"], None)
+            self.done.appendleft(dict(rec))
+            if self.path:
+                try:
+                    with open(self.path, "a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(rec) + "\n")
+                except OSError:
+                    LOG.warning("cannot append to review store %s", self.path)
+
+    def snapshot(self):
+        now = time.time()
+        with self.lock:
+            live = []
+            for rec in self.live.values():
+                elapsed = now - rec["started"]
+                # Progress is an estimate: the model call reports no percentage.
+                pct = {"queued": 3, "collecting": 12, "reviewing": 25, "posting": 90}.get(rec["stage"], 5)
+                if rec["stage"] == "reviewing":
+                    pct = min(85, 25 + 60 * elapsed / self.est)
+                live.append(dict(rec, elapsed=round(elapsed, 1), pct=round(pct)))
+            done = [dict(r) for r in self.done]
+        live.sort(key=lambda r: r["id"])
+        return {"live": live, "history": done, "stats": stats_of(done, live, now)}
+
+
+def stats_of(done, live, now):
+    day = time.localtime(now)[:3]
+    durations = sorted(r["duration"] for r in done if r.get("duration"))
+    verdicts = {}
+    for rec in done:
+        if rec.get("verdict"):
+            verdicts[rec["verdict"]] = verdicts.get(rec["verdict"], 0) + 1
+    failed = sum(1 for r in done if r.get("status") == "failed")
+
+    def pct(p):
+        if not durations:
+            return 0.0
+        return round(durations[min(len(durations) - 1, int(len(durations) * p / 100))], 1)
+
+    return {"total": len(done) + len(live),
+            "today": sum(1 for r in done + live
+                         if time.localtime(r.get("started") or now)[:3] == day),
+            "running": len(live), "failed": failed, "verdicts": verdicts,
+            "avg": round(sum(durations) / len(durations), 1) if durations else 0.0,
+            "p50": pct(50), "p95": pct(95),
+            "inline": sum(int(r.get("inline") or 0) for r in done)}
+
+
+_tracker = Tracker(os.getenv("REVIEW_STORE", ""))
+
+
+def _dashboard_html():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except OSError:
+        return "<h1>AI Code Reviewer</h1><p>dashboard.html missing</p>"
+
+
+DASHBOARD_HTML = _dashboard_html()
 
 
 SEVERITY_HEADING = re.compile(r"(?i)\b(critical|warning|suggestion|nit)\b")
@@ -582,7 +698,12 @@ def collect_github(payload, config):
             "head": (pr.get("head") or {}).get("sha") or ""}
 
 
-def process(platform, event, payload, config):
+def process(platform, event, payload, config, track=None):
+    """Review one MR/PR. `track(stage, **fields)` reports progress to the dashboard."""
+    def mark(stage, **fields):
+        if track:
+            track(stage, **fields)
+
     if not isinstance(payload, dict):
         raise ValueError("invalid payload")
     if platform == "gitlab":
@@ -610,16 +731,19 @@ def process(platform, event, payload, config):
     draft = bool(job.get("draft"))
     if draft:
         LOG.info("target is a draft, reviewing but not approving")
+    mark("reviewing", files=len(job["files"]))
     review = run_hermes(job["header"] + "\n\nDiff:\n" + diff)
     if superseded(platform, job, config):
         LOG.info("head moved during review, discarding stale result")
         return False
     verdict = verdict_of(review)
+    mark("posting", verdict=verdict)
     if platform == "gitlab":
         inline = gl_post_inline(job["base"], job["token"], job["path"], review, job["files"], job["refs"])
         api(job["base"], job["token"], "gitlab", job["path"] + "/notes",
             {"body": review_body(review, job["author"], verdict, posted=inline)})
         LOG.info("MR reviewed: verdict=%s inline=%d access=%s", verdict, len(inline), job["level"])
+        mark("posting", inline=len(inline))
         if verdict == "APPROVE" and not draft and job["level"] >= APPROVE_ACCESS_LEVEL:
             LOG.info("MR approved: %s", gl_approve(job["base"], job["token"], job["path"], job["author"]))
     else:
@@ -632,6 +756,7 @@ def process(platform, event, payload, config):
             api(job["base"], job["token"], "github", f"/repos/{job['repo']}/pulls/{job['number']}/reviews",
                 {"body": review_body(review, job["author"], verdict, marker=False), "event": event})
         LOG.info("PR reviewed: verdict=%s event=%s inline=%d", verdict, event, inline)
+        mark("posting", inline=inline)
     return True
 
 
@@ -670,19 +795,57 @@ def worker():
 
 
 def run_job(platform, event, payload, cfg, raw, key):
+    rec = _tracker.begin(platform, label_of(platform, payload), author_of(payload))
+    fields = {}
+
+    def track(stage, **more):
+        fields.update(more)
+        _tracker.stage(rec, stage)
+
     try:
         with target_lock(key):
             if is_note_event(platform, payload):
                 posted = debate(platform, payload, cfg)
             else:
-                posted = process(platform, event, payload, cfg)
+                posted = process(platform, event, payload, cfg, track)
             LOG.info("%s review: %s", platform, "posted" if posted else "ignored")
+            _tracker.finish(rec, "done" if posted else "skipped", **fields)
     except (ValueError, TypeError, UnicodeError) as error:
         LOG.warning("%s review rejected: %s", platform, error)
+        _tracker.finish(rec, "failed", error=str(error), **fields)
         release(platform, raw)
-    except (OSError, URLError, subprocess.SubprocessError):
+    except (OSError, URLError, subprocess.SubprocessError) as error:
         LOG.exception("%s review failed", platform)
+        _tracker.finish(rec, "failed", error=str(error) or type(error).__name__, **fields)
         release(platform, raw)  # allow the platform's retry to run again
+
+
+def label_of(platform, payload):
+    """Short human label for the dashboard, e.g. `group/project!12` or `owner/repo#7`."""
+    try:
+        if platform == "gitlab":
+            attrs = payload["object_attributes"]
+            name = (payload.get("project") or {}).get("path_with_namespace") or str(payload["project"]["id"])
+            return "%s!%s" % (name, attrs["iid"])
+        if payload.get("object_kind") == "note":
+            mr = payload["merge_request"]
+            name = (payload.get("project") or {}).get("path_with_namespace") or str(payload["project"]["id"])
+            return "%s!%s" % (name, mr["iid"])
+        repo = (payload.get("repository") or {}).get("full_name") or "?"
+        return "%s#%s" % (repo, payload.get("issue", {}).get("number") or payload.get("number", "?"))
+    except (KeyError, TypeError, AttributeError):
+        return "?"
+
+
+def author_of(payload):
+    try:
+        if payload.get("object_kind") == "note":
+            return (payload.get("user") or {}).get("username", "")
+        if "object_attributes" in payload:
+            return (payload["object_attributes"].get("author") or {}).get("username", "")
+        return ((payload.get("pull_request") or {}).get("user") or {}).get("login", "")
+    except (KeyError, TypeError, AttributeError):
+        return ""
 
 
 def is_note_event(platform, payload):
@@ -750,7 +913,44 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        self.respond(200, "ok") if self.path == "/health" else self.respond(404, "not found")
+        self.extra_headers = []
+        path, _, query = self.path.partition("?")
+        if path == "/health":
+            return self.respond(200, "ok")
+        if path in ("/", "/dashboard"):
+            if not self.authorized(query):
+                return self.respond(403, "dashboard token required")
+            return self.reply(200, DASHBOARD_HTML, "text/html; charset=utf-8")
+        if path == "/api/reviews":
+            if not self.authorized(query):
+                return self.respond(403, "dashboard token required")
+            data = _tracker.snapshot()
+            data["stats"]["queued"] = _jobs.qsize()
+            data["stats"]["workers"] = MAX_WORKERS
+            return self.reply(200, json.dumps(data), "application/json")
+        self.respond(404, "not found")
+
+    def authorized(self, query):
+        """DASHBOARD_TOKEN unset = open; set = require it as ?token= (kept in a cookie)."""
+        if not DASHBOARD_TOKEN:
+            return True
+        given = parse_qs(query).get("token", [""])[0]
+        cookie = re.search(r"(?:^|;\s*)dash=([^;]+)", self.headers.get("Cookie", ""))
+        if given and hmac.compare_digest(given, DASHBOARD_TOKEN):
+            self.extra_headers.append(("Set-Cookie", "dash=%s; Path=/; HttpOnly; SameSite=Strict" % DASHBOARD_TOKEN))
+            return True
+        return bool(cookie and hmac.compare_digest(cookie.group(1), DASHBOARD_TOKEN))
+
+    def reply(self, status, text, ctype):
+        body = text.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for key, value in self.extra_headers:
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self):
         platform = {"/gl-review": "gitlab", "/gh-review": "github"}.get(self.path)

@@ -139,7 +139,7 @@ class HandlerTests(unittest.TestCase):
         headers = {"X-Hub-Signature-256": sign_github(raw), "X-GitHub-Event": "pull_request"}
         done = threading.Event()
 
-        def fake_process(platform, event, payload, config):
+        def fake_process(platform, event, payload, config, track=None):
             done.set()
             return True
 
@@ -551,6 +551,100 @@ class SummaryCoverageTests(unittest.TestCase):
         body = server.review_body(review, "alice", "APPROVE", posted={("a.py", 1)})
         self.assertNotIn("a.py:1", body)
         self.assertIn("keep me", body)
+
+
+class TrackerTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "reviews.jsonl")
+        self.t = server.Tracker(self.path, limit=5, est=10)
+
+    def test_live_job_reports_progress_then_lands_in_history(self):
+        rec = self.t.begin("gitlab", "g/p!1", "alice", files=2)
+        self.assertEqual(self.t.snapshot()["stats"]["running"], 1)
+        self.t.stage(rec, "reviewing")
+        live = self.t.snapshot()["live"][0]
+        self.assertEqual(live["stage"], "reviewing")
+        self.assertGreaterEqual(live["pct"], 25)
+        self.assertLessEqual(live["pct"], 85)
+        self.t.finish(rec, verdict="APPROVE", inline=3)
+        snap = self.t.snapshot()
+        self.assertEqual(snap["live"], [])
+        self.assertEqual(snap["history"][0]["verdict"], "APPROVE")
+        self.assertEqual(snap["stats"]["running"], 0)
+        self.assertEqual(snap["stats"]["verdicts"], {"APPROVE": 1})
+
+    def test_history_survives_restart(self):
+        rec = self.t.begin("github", "a/b#2")
+        self.t.finish(rec, verdict="REQUEST_CHANGES")
+        again = server.Tracker(self.path)
+        self.assertEqual(len(again.snapshot()["history"]), 1)
+        self.assertEqual(again.snapshot()["stats"]["total"], 1)
+        self.assertEqual(again.seq, rec["id"])
+
+    def test_failure_is_recorded_with_reason(self):
+        rec = self.t.begin("gitlab", "g/p!3")
+        self.t.finish(rec, "failed", error="diff too large for one review")
+        snap = self.t.snapshot()
+        self.assertEqual(snap["stats"]["failed"], 1)
+        self.assertEqual(snap["history"][0]["error"], "diff too large for one review")
+
+    def test_history_is_bounded(self):
+        for i in range(8):
+            self.t.finish(self.t.begin("gitlab", "g/p!%d" % i))
+        self.assertEqual(len(self.t.snapshot()["history"]), 5)
+
+    def test_corrupt_store_line_is_ignored(self):
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write('{"id": 2, "target": "ok"}\nnot json\n')
+        snap = server.Tracker(self.path).snapshot()
+        self.assertEqual([r["target"] for r in snap["history"]], ["ok"])
+
+
+class DashboardTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old = server._tracker
+        server._tracker = server.Tracker(os.path.join(self.tmp, "r.jsonl"))
+        server.DASHBOARD_TOKEN = ""
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.base = "http://127.0.0.1:%d" % self.httpd.server_address[1]
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        server._tracker = self.old
+        server.DASHBOARD_TOKEN = ""
+
+    def get(self, path):
+        try:
+            with urlopen(self.base + path, timeout=5) as r:
+                return r.status, r.read().decode()
+        except HTTPError as error:
+            return error.code, error.read().decode()
+
+    def test_dashboard_page_and_json(self):
+        status, page = self.get("/dashboard")
+        self.assertEqual(status, 200)
+        self.assertIn("AI Code Reviewer", page)
+        self.assertIn("/api/reviews", page)
+        status, body = self.get("/api/reviews")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(set(data), {"live", "history", "stats"})
+        self.assertEqual(data["stats"]["workers"], server.MAX_WORKERS)
+
+    def test_token_gate_when_configured(self):
+        server.DASHBOARD_TOKEN = "s3cret"
+        self.assertEqual(self.get("/api/reviews")[0], 403)
+        self.assertEqual(self.get("/api/reviews?token=wrong")[0], 403)
+        self.assertEqual(self.get("/dashboard")[0], 403)
+        self.assertEqual(self.get("/api/reviews?token=s3cret")[0], 200)
+
+    def test_health_needs_no_token(self):
+        server.DASHBOARD_TOKEN = "s3cret"
+        self.assertEqual(self.get("/health")[0], 200)
 
 
 class RealModelOutputTests(unittest.TestCase):

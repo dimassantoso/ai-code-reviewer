@@ -7,6 +7,7 @@ FROM nousresearch/hermes-agent@sha256:3e9fe4c6ef36490f43aa0d0d80f9df64e9c92a576e
 
 WORKDIR /app
 COPY server.py /app/server.py
+COPY dashboard.html /app/dashboard.html
 # Bundled-skills dir: the image's stage2 hook syncs /opt/hermes/skills into
 # $HERMES_HOME/skills on every boot, which is how `hermes -s ai-code-reviewer`
 # resolves the skill inside the container.
