@@ -566,6 +566,74 @@ class SummaryCoverageTests(unittest.TestCase):
         self.assertIn("keep me", body)
 
 
+class RemarkTests(unittest.TestCase):
+    """A skipped row must say why, not just "skipped"."""
+
+    def process(self, payload, event="Merge Request Hook"):
+        with patch.object(server, "api", return_value=json.dumps(
+                {"permissions": {"project_access": {"access_level": 40}}}).encode()), \
+                patch.object(server, "run_hermes") as hermes:
+            result = server.process("gitlab", event, payload, GL_CONFIG)
+        return result, hermes
+
+    def test_wrong_event_says_so(self):
+        seen = {}
+        payload = {"object_kind": "push"}
+        with patch.object(server, "api"), patch.object(server, "run_hermes") as hermes:
+            self.assertFalse(server.process("gitlab", "Push Hook", payload, GL_CONFIG,
+                                            lambda stage, **kw: seen.update(kw)))
+        hermes.assert_not_called()
+        self.assertIn("not a merge request event", seen["remark"])
+
+    def test_ignored_action_says_so(self):
+        seen = {}
+        payload = {"object_kind": "merge_request", "project": {"id": 1},
+                   "object_attributes": {"iid": 2, "action": "close"}}
+        with patch.object(server, "api"), patch.object(server, "run_hermes"):
+            self.assertFalse(server.process("gitlab", "Merge Request Hook", payload, GL_CONFIG,
+                                            lambda stage, **kw: seen.update(kw)))
+        self.assertIn("close", seen["remark"])
+
+    def test_low_access_reason_is_returned(self):
+        payload = {"object_kind": "merge_request", "project": {"id": 1},
+                   "object_attributes": {"iid": 2, "action": "update"}}
+        seen = {}
+        with patch.object(server, "api", return_value=json.dumps(
+                {"permissions": {"project_access": {"access_level": 10}}}).encode()), \
+                patch.object(server, "run_hermes") as hermes:
+            self.assertFalse(server.process("gitlab", "Merge Request Hook", payload, GL_CONFIG,
+                                            lambda stage, **kw: seen.update(kw)))
+        hermes.assert_not_called()
+        self.assertIn("MIN_ACCESS_LEVEL", seen["remark"])
+
+    def test_unchanged_head_reason_is_returned(self):
+        server._reviewed.clear()
+        payload = {"object_kind": "merge_request", "project": {"id": 1},
+                   "object_attributes": {"iid": 2, "action": "update"}}
+        def fake_api(base, token, platform, path, body=None, accept="application/json"):
+            if path == "/projects/1":
+                return json.dumps({"permissions": {"project_access": {"access_level": 40}}}).encode()
+            if path.endswith("/changes?access_raw_diffs=true"):
+                return json.dumps({"changes": [{"new_path": "a.py", "diff": "@@ -0,0 +1 @@\n+x"}],
+                                   "overflow": False}).encode()
+            return json.dumps({"author": {"username": "dimas"},
+                               "diff_refs": {"head_sha": "deadbeef"}}).encode()
+        seen = {}
+        with patch.object(server, "api", side_effect=fake_api), \
+                patch.object(server, "run_hermes", return_value="VERDICT: APPROVE"):
+            self.assertTrue(server.process("gitlab", "Merge Request Hook", payload, GL_CONFIG))
+            self.assertFalse(server.process("gitlab", "Merge Request Hook", payload, GL_CONFIG,
+                                            lambda stage, **kw: seen.update(kw)))
+        self.assertIn("unchanged", seen["remark"])
+
+    def test_skip_reason_lands_in_the_history_record(self):
+        tracker = server.Tracker(os.path.join(tempfile.mkdtemp(), "r.jsonl"))
+        rec = tracker.begin("gitlab", "g/p!1")
+        tracker.finish(rec, "skipped", remark="MR action 'close' does not trigger a review")
+        self.assertEqual(tracker.snapshot()["history"][0]["remark"],
+                         "MR action 'close' does not trigger a review")
+
+
 class ApiRetryTests(unittest.TestCase):
     """A dropped connection must not fail the review; a bad response must."""
 
@@ -737,6 +805,15 @@ class LinkTests(unittest.TestCase):
         self.assertEqual(server.label_from_url("https://gitlab.com/g/p/-/merge_requests/12"), "g/p!12")
         self.assertEqual(server.label_from_url("https://github.com/a/b/pull/7"), "a/b#7")
         self.assertEqual(server.label_from_url("https://example.com/nope"), "")
+
+    def test_old_note_url_loses_its_anchor_on_load(self):
+        path = os.path.join(tempfile.mkdtemp(), "r.jsonl")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"id": 4, "target": "?", "status": "done",
+                                 "url": "https://gitlab.com/g/p/-/merge_requests/9#note_77"}) + "\n")
+        row = server.Tracker(path).snapshot()["history"][0]
+        self.assertEqual(row["url"], "https://gitlab.com/g/p/-/merge_requests/9")
+        self.assertEqual(row["target"], "g/p!9")
 
     def test_old_record_without_target_is_repaired_on_load(self):
         path = os.path.join(tempfile.mkdtemp(), "r.jsonl")

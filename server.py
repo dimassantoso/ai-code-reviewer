@@ -168,8 +168,10 @@ class Tracker:
                     except ValueError:
                         continue
                     if isinstance(rec, dict) and "id" in rec:
-                        if rec.get("target") in ("", "?", None) and rec.get("url"):
-                            rec["target"] = label_from_url(rec["url"]) or rec["target"]
+                        if rec.get("url"):
+                            rec["url"] = rec["url"].split("#")[0]  # drop note anchors from old rows
+                            if rec.get("target") in ("", "?", None):
+                                rec["target"] = label_from_url(rec["url"]) or rec["target"]
                         self.done.appendleft(rec)
                         self.seq = max(self.seq, int(rec["id"]))
         except OSError:
@@ -180,7 +182,8 @@ class Tracker:
             self.seq += 1
             rec = {"id": self.seq, "platform": platform, "target": target, "author": author, "url": url,
                    "status": "running", "stage": "queued", "started": time.time(),
-                   "duration": 0.0, "verdict": "", "inline": 0, "files": files, "error": ""}
+                   "duration": 0.0, "verdict": "", "inline": 0, "files": files, "error": "",
+                   "remark": ""}
             self.live[self.seq] = rec
             return rec
 
@@ -692,19 +695,19 @@ def collect_gitlab(payload, config):
     level = gl_access_level(base, token, pid)
     if level < MIN_ACCESS_LEVEL:
         LOG.info("project %s: access %s < MIN_ACCESS_LEVEL %s, skipping", pid, level, MIN_ACCESS_LEVEL)
-        return None
+        return "your token has access level %s, below MIN_ACCESS_LEVEL %s" % (level, MIN_ACCESS_LEVEL)
     path = f"/projects/{pid}/merge_requests/{iid}"
     if attrs.get("action") == "open":
         notes = api_json(base, token, "gitlab", path + "/notes?per_page=100&sort=desc")
         if isinstance(notes, list) and any(REVIEW_MARKER in (n.get("body") or "") for n in notes):
             LOG.info("MR !%s already reviewed on open, skipping", iid)
-            return None
+            return "already reviewed when it was opened"
     changes = api_json(base, token, "gitlab", path + "/changes?access_raw_diffs=true")
     if not isinstance(changes, dict) or changes.get("overflow") or not isinstance(changes.get("changes"), list):
         raise ValueError("incomplete merge request diff")
     files = [c for c in changes["changes"] if isinstance(c, dict)]
     if not any((c.get("diff") or "").strip() for c in files):
-        return None
+        return "no changed lines to review (empty diff)"
     meta = api_json(base, token, "gitlab", path)
     meta = meta if isinstance(meta, dict) else {}
     author = (meta.get("author") or {}).get("username", "")
@@ -730,7 +733,7 @@ def collect_github(payload, config):
     raw = api(base, token, "github", f"/repos/{full_name}/pulls/{number}",
               accept="application/vnd.github.v3.diff").decode("utf-8")
     if not raw.strip():
-        return None
+        return "no changed lines to review (empty diff)"
     pr = api_json(base, token, "github", f"/repos/{full_name}/pulls/{number}") or {}
     pr = pr if isinstance(pr, dict) else {}
     author = (pr.get("user") or {}).get("login", "")
@@ -749,23 +752,31 @@ def process(platform, event, payload, config, track=None):
         if track:
             track(stage, **fields)
 
+    def skip(reason):
+        """Not reviewed, and the dashboard says why."""
+        mark("skipped", remark=reason)
+        return False
+
     if not isinstance(payload, dict):
         raise ValueError("invalid payload")
     if platform == "gitlab":
         attrs = payload.get("object_attributes")
         if event != "Merge Request Hook" or payload.get("object_kind") != "merge_request":
-            return False
+            return skip("not a merge request event (%s)" % (event or "no event header"))
         if not isinstance(attrs, dict) or attrs.get("action") not in ("open", "update", "reopen"):
-            return False
+            action = attrs.get("action") if isinstance(attrs, dict) else "?"
+            return skip("MR action %r does not trigger a review" % action)
         job = collect_gitlab(payload, config)
     else:
         if event != "pull_request":
-            return False
+            return skip("not a pull request event (%s)" % (event or "no event header"))
         if payload.get("action") not in ("opened", "synchronize", "reopened"):
-            return False
+            return skip("PR action %r does not trigger a review" % payload.get("action"))
         job = collect_github(payload, config)
+    if isinstance(job, str):  # collector refused: it returns the reason
+        return skip(job)
     if not job:
-        return False
+        return skip("nothing to review")
     diff = job["diff"]
     # ponytail: reject oversized diffs rather than silently review incomplete code; add chunked reviews when needed.
     if len(diff) > MAX_DIFF:
@@ -775,7 +786,7 @@ def process(platform, event, payload, config, track=None):
     with _reviewed_lock:
         if head and _reviewed.get(key) == head:
             LOG.info("%s unchanged since last review (head %s), skipping", key, head[:8])
-            return False
+            return skip("code unchanged since the last review (head %s)" % head[:8])
     draft = bool(job.get("draft"))
     if draft:
         LOG.info("target is a draft, reviewing but not approving")
@@ -783,7 +794,7 @@ def process(platform, event, payload, config, track=None):
     review = run_hermes(job["header"] + "\n\nDiff:\n" + diff)
     if superseded(platform, job, config):
         LOG.info("head moved during review, discarding stale result")
-        return False
+        return skip("new commits landed during the review, result discarded")
     verdict = verdict_of(review)
     mark("posting", verdict=verdict)
     if platform == "gitlab":
@@ -874,7 +885,10 @@ def run_job(platform, event, payload, cfg, raw, key):
             else:
                 posted = process(platform, event, payload, cfg, track)
             LOG.info("%s review: %s", platform, "posted" if posted else "ignored")
-            _tracker.finish(rec, "done" if posted else "skipped", **fields)
+            if posted:
+                _tracker.finish(rec, "done", **fields)
+            else:
+                _tracker.finish(rec, "skipped", remark=fields.get("remark") or "not reviewed", **fields)
     except (ValueError, TypeError, UnicodeError) as error:
         LOG.warning("%s review rejected: %s", platform, error)
         _tracker.finish(rec, "failed", error=str(error), **fields)
