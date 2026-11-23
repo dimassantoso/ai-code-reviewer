@@ -569,6 +569,39 @@ class SummaryCoverageTests(unittest.TestCase):
 GL_CONFIG = {"token": "t", "secret": "s", "url": "https://gitlab.com"}
 
 
+class RunJobRemarkTests(unittest.TestCase):
+    """Regression: a skip must stay a skip, never become a failed row."""
+
+    def run_one(self, payload, event):
+        tracker = server.Tracker(os.path.join(tempfile.mkdtemp(), "r.jsonl"))
+        old = server._tracker
+        server._tracker = tracker
+        try:
+            server.run_job("gitlab", event, payload, GL_CONFIG, b"raw", None)
+        finally:
+            server._tracker = old
+        return tracker.snapshot()["history"][0]
+
+    def test_ignored_event_is_skipped_with_a_remark(self):
+        row = self.run_one({"object_kind": "push"}, "Push Hook")
+        self.assertEqual(row["status"], "skipped")
+        self.assertIn("not a merge request event", row["remark"])
+        self.assertEqual(row["error"], "")
+
+    def test_failure_reports_its_error_without_a_remark_collision(self):
+        payload = {"object_kind": "merge_request", "project": {"id": 1},
+                   "object_attributes": {"iid": 2, "action": "update"}}
+
+        def boom(*a, **kw):
+            raise ValueError("diff too large for one review")
+
+        with patch.object(server, "collect_gitlab", side_effect=boom):
+            row = self.run_one(payload, "Merge Request Hook")
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["error"], "diff too large for one review")
+        self.assertNotIn("multiple values", row["error"])
+
+
 class RemarkTests(unittest.TestCase):
     """A skipped row must say why, not just "skipped"."""
 

@@ -172,6 +172,8 @@ class Tracker:
                             rec["url"] = rec["url"].split("#")[0]  # drop note anchors from old rows
                             if rec.get("target") in ("", "?", None):
                                 rec["target"] = label_from_url(rec["url"]) or rec["target"]
+                        if not rec.get("remark"):
+                            rec["remark"] = remark_of(rec)
                         self.done.appendleft(rec)
                         self.seq = max(self.seq, int(rec["id"]))
         except OSError:
@@ -240,6 +242,17 @@ def label_from_url(url):
     match = re.match(r"https://[^/]+/(.+?)/pull/(\d+)", url or "")
     if match:
         return "%s#%s" % (match.group(1), match.group(2))
+    return ""
+
+
+def remark_of(rec):
+    """Explain a record written before remarks existed, from what it already has."""
+    if rec.get("error"):
+        return ""
+    if rec.get("verdict"):
+        return ""
+    if rec.get("status") == "skipped":
+        return "skipped by an older build, which did not record a reason"
     return ""
 
 
@@ -902,14 +915,17 @@ def run_job(platform, event, payload, cfg, raw, key):
             if posted:
                 _tracker.finish(rec, "done", **fields)
             else:
-                _tracker.finish(rec, "skipped", remark=fields.get("remark") or "not reviewed", **fields)
+                fields.setdefault("remark", "not reviewed")
+                _tracker.finish(rec, "skipped", **fields)
     except (ValueError, TypeError, UnicodeError) as error:
         LOG.warning("%s review rejected: %s", platform, error)
-        _tracker.finish(rec, "failed", error=str(error), **fields)
+        fields["error"] = str(error)
+        _tracker.finish(rec, "failed", **fields)
         release(platform, raw)
     except (OSError, URLError, subprocess.SubprocessError) as error:
         LOG.exception("%s review failed", platform)
-        _tracker.finish(rec, "failed", error=str(error) or type(error).__name__, **fields)
+        fields["error"] = str(error) or type(error).__name__
+        _tracker.finish(rec, "failed", **fields)
         release(platform, raw)  # allow the platform's retry to run again
 
 
