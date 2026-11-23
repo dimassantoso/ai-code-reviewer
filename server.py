@@ -728,9 +728,12 @@ def process(platform, event, payload, config, track=None):
     # ponytail: reject oversized diffs rather than silently review incomplete code; add chunked reviews when needed.
     if len(diff) > MAX_DIFF:
         raise ValueError("diff too large for one review")
-    if BOT_USERNAME and job["author"] == BOT_USERNAME:
-        LOG.info("author is the bot, skipping self-review")
-        return False
+    key = review_key(platform, job)
+    head = job.get("head") or ""
+    with _reviewed_lock:
+        if head and _reviewed.get(key) == head:
+            LOG.info("%s unchanged since last review (head %s), skipping", key, head[:8])
+            return False
     draft = bool(job.get("draft"))
     if draft:
         LOG.info("target is a draft, reviewing but not approving")
@@ -760,11 +763,27 @@ def process(platform, event, payload, config, track=None):
                 {"body": review_body(review, job["author"], verdict, marker=False), "event": event})
         LOG.info("PR reviewed: verdict=%s event=%s inline=%d", verdict, event, inline)
         mark("posting", inline=inline)
+    with _reviewed_lock:
+        if head:
+            if len(_reviewed) > 5000:  # ponytail: whole-map reset beats an LRU here
+                _reviewed.clear()
+            _reviewed[key] = head
     return True
+
+
+def review_key(platform, job):
+    """Stable identity of the reviewed target, used for the head-SHA memory."""
+    if platform == "gitlab":
+        return "%s/%s" % (job["base"], job["path"])
+    return "%s/%s#%s" % (job["base"], job["repo"], job["number"])
 
 
 _seen = {}
 _seen_lock = threading.Lock()
+# Target -> head SHA we already reviewed. Stops the approve->update->review loop:
+# our own approval fires a fresh MR event, but the code did not change.
+_reviewed = {}
+_reviewed_lock = threading.Lock()
 
 # Bounded review concurrency: each review spawns a `hermes` subprocess, so an
 # unbounded thread-per-webhook lets a burst exhaust memory/processes. Jobs go to

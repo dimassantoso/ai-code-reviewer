@@ -21,6 +21,7 @@ import server  # noqa: E402
 
 # Ambient env must not change results: these three are module-level constants.
 server.BOT_USERNAME = ""
+server._reviewed.clear()
 server.MIN_ACCESS_LEVEL = 30
 server.APPROVE_ACCESS_LEVEL = 40
 
@@ -309,7 +310,16 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(ApiStub.notes, [])
 
 
-class GitHubFlowTests(unittest.TestCase):
+class IsolatedCase(unittest.TestCase):
+    """Every test starts with an empty dedupe/head memory."""
+
+    def setUp(self):
+        server._seen.clear()
+        server._reviewed.clear()
+        server._targets.clear()
+
+
+class GitHubFlowTests(IsolatedCase):
     CONFIG = {"token": "gh", "secret": SECRET, "url": "https://api.github.com"}
 
     def payload(self, action="opened"):
@@ -996,19 +1006,62 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(server.verdict_of("VERDICT: APPROVE"), "APPROVE")
         self.assertEqual(server.verdict_of("VERDICT: APPROVE\nVERDICT: REQUEST_CHANGES"), "REQUEST_CHANGES")
 
-    def test_bot_author_not_reviewed(self):
+    def test_bot_authored_mr_is_reviewed(self):
+        """The bot's own MRs are reviewed: BOT_USERNAME is the webhook user, not a skip list."""
         server.BOT_USERNAME = "santosodb"
         def fake_api(base, token, platform, path, body=None, accept="application/json"):
             if path == "/projects/1":
                 return json.dumps({"permissions": {"project_access": {"access_level": 40}}}).encode()
             if path.endswith("/changes?access_raw_diffs=true"):
-                return json.dumps({"changes": [{"new_path": "a.py", "diff": "+x"}], "overflow": False}).encode()
+                return json.dumps({"changes": [{"new_path": "a.py", "diff": "@@ -0,0 +1 @@\n+x"}], "overflow": False}).encode()
             return json.dumps({"author": {"username": "santosodb"}, "diff_refs": {}}).encode()
-        with patch.object(server, "api", side_effect=fake_api), patch.object(server, "run_hermes") as hermes:
-            self.assertFalse(server.process("gitlab", "Merge Request Hook", {
+        with patch.object(server, "api", side_effect=fake_api), \
+                patch.object(server, "run_hermes", return_value="VERDICT: APPROVE") as hermes:
+            self.assertTrue(server.process("gitlab", "Merge Request Hook", {
                 "object_kind": "merge_request", "project": {"id": 1},
                 "object_attributes": {"iid": 2, "action": "update"}}, self.GL))
-        hermes.assert_not_called()
+        hermes.assert_called_once()
+
+    def test_same_head_is_not_reviewed_twice(self):
+        """Our own approval triggers another MR event; the head did not move, so skip."""
+        server._reviewed.clear()
+        calls = {"n": 0}
+        def fake_api(base, token, platform, path, body=None, accept="application/json"):
+            if path == "/projects/1":
+                return json.dumps({"permissions": {"project_access": {"access_level": 40}}}).encode()
+            if path.endswith("/changes?access_raw_diffs=true"):
+                return json.dumps({"changes": [{"new_path": "a.py", "diff": "@@ -0,0 +1 @@\n+x"}],
+                                   "overflow": False}).encode()
+            return json.dumps({"author": {"username": "dimas"},
+                               "diff_refs": {"head_sha": "abc123"}}).encode()
+        payload = {"object_kind": "merge_request", "project": {"id": 1},
+                   "object_attributes": {"iid": 2, "action": "update"}}
+        with patch.object(server, "api", side_effect=fake_api), \
+                patch.object(server, "run_hermes", return_value="VERDICT: APPROVE") as hermes:
+            self.assertTrue(server.process("gitlab", "Merge Request Hook", payload, self.GL))
+            self.assertFalse(server.process("gitlab", "Merge Request Hook", payload, self.GL))
+            calls["n"] = hermes.call_count
+        self.assertEqual(calls["n"], 1)
+
+    def test_new_head_is_reviewed_again(self):
+        server._reviewed.clear()
+        heads = {"sha": "aaa"}
+        def fake_api(base, token, platform, path, body=None, accept="application/json"):
+            if path == "/projects/1":
+                return json.dumps({"permissions": {"project_access": {"access_level": 40}}}).encode()
+            if path.endswith("/changes?access_raw_diffs=true"):
+                return json.dumps({"changes": [{"new_path": "a.py", "diff": "@@ -0,0 +1 @@\n+x"}],
+                                   "overflow": False}).encode()
+            return json.dumps({"author": {"username": "dimas"},
+                               "diff_refs": {"head_sha": heads["sha"]}}).encode()
+        payload = {"object_kind": "merge_request", "project": {"id": 1},
+                   "object_attributes": {"iid": 2, "action": "update"}}
+        with patch.object(server, "api", side_effect=fake_api), \
+                patch.object(server, "run_hermes", return_value="VERDICT: APPROVE") as hermes:
+            self.assertTrue(server.process("gitlab", "Merge Request Hook", payload, self.GL))
+            heads["sha"] = "bbb"
+            self.assertTrue(server.process("gitlab", "Merge Request Hook", payload, self.GL))
+            self.assertEqual(hermes.call_count, 2)
 
     def test_already_reviewed_open_mr_skipped(self):
         def fake_api(base, token, platform, path, body=None, accept="application/json"):
