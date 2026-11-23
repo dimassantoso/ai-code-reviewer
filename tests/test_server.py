@@ -950,7 +950,8 @@ class ChunkedReviewTests(unittest.TestCase):
         total = sum(len(f["diff"]) for f in files)
         self.assertGreater(total, server.MAX_DIFF)
         calls = []
-        with patch.object(server, "run_hermes", side_effect=lambda q: calls.append(q) or "finding\nVERDICT: APPROVE"):
+        with patch.object(server, "run_hermes",
+                          side_effect=lambda q, **kw: calls.append(q) or "finding\nVERDICT: APPROVE"):
             out = server.review_diff("HDR", "\n".join(f["diff"] for f in files), files)
         self.assertGreater(len(calls), 1)
         for i, chunk in enumerate(calls, 1):
@@ -979,6 +980,49 @@ class ChunkedReviewTests(unittest.TestCase):
         self.assertIn("REQUEST_CHANGES", merged)
         self.assertIn("bug here", merged)
         self.assertNotIn("VERDICT: APPROVE", merged)
+
+
+class ReviewBudgetTests(unittest.TestCase):
+    """A huge diff must degrade to a partial, labelled review — never a bare timeout."""
+
+    def files(self, count, size):
+        return [{"new_path": "f%d.py" % i, "diff": "\n".join(
+            ["@@ -1,%d +1,%d @@" % (size, size)] + ["+line %d of %d" % (n, i) for n in range(size)])}
+            for i in range(count)]
+
+    def test_budget_skips_the_tail_and_says_so(self):
+        files = self.files(40, 40)
+        calls = []
+        clock = iter([0, 0, 9999])  # first part starts, then the budget is gone
+
+        def fake_run(prompt, timeout=None):
+            calls.append(prompt)
+            return "finding\nVERDICT: REQUEST_CHANGES"
+
+        with patch.object(server, "run_hermes", side_effect=fake_run), \
+                patch.object(server, "MAX_DIFF", 400), patch.object(server, "time") as fake_time:
+            fake_time.monotonic = lambda: next(clock, 9999)
+            out = server.review_diff("HDR", "x" * 5000, files, budget=100)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("did not fit the 100s budget", out)
+        self.assertIn("REQUEST_CHANGES", out)
+
+    def test_partial_review_still_posts_a_verdict(self):
+        files = self.files(30, 40)
+        with patch.object(server, "MAX_DIFF", 400), \
+                patch.object(server, "run_hermes", return_value="ok\nVERDICT: APPROVE"):
+            out = server.review_diff("HDR", "x" * 5000, files, budget=10_000)
+        self.assertEqual(server.verdict_of(out), "APPROVE")
+        self.assertNotIn("did not fit", out)
+
+    def test_zero_budget_is_an_error_not_silence(self):
+        with patch.object(server, "MAX_DIFF", 400), \
+                patch.object(server, "run_hermes") as hermes, \
+                patch.object(server, "time") as fake_time:
+            fake_time.monotonic = lambda: 0
+            with self.assertRaises(ValueError):
+                server.review_diff("HDR", "x" * 5000, self.files(20, 40), budget=5)
+        hermes.assert_not_called()
 
 
 class ReviewerFlagTests(unittest.TestCase):
