@@ -127,6 +127,20 @@ python3 tests/loadtest.py --requests 200 --concurrency 32 --workers 4
 
 Tests use mocks and do not prove platform credentials, network access or model readiness.
 
+## Dashboard and access
+
+`GET /dashboard` shows live reviews (stage, elapsed, progress), totals, average and p95 duration, verdict counts and history. `GET /api/reviews` is the same data as JSON.
+
+Access is HTTP Basic when `DASHBOARD_PASSWORD` is set — the browser's own login prompt, no token in the URL, nothing to leak in bookmarks or referrers. Blank password leaves it open, which is only acceptable when a proxy does the gating.
+
+Three ways to expose it, pick one:
+
+- **Tailscale (simplest).** Bind to the tailnet and skip app auth: `BIND_HOST=<tailscale-ip>`. Only devices on the tailnet can reach the port.
+- **Cloudflare Zero Trust.** Point an Access application at the dashboard hostname, add an allow policy for your email/IdP, then leave `DASHBOARD_PASSWORD` blank — Access authenticates before the request reaches the server. Keep the webhook path (`/gl-review`, `/gh-review`) outside the Access policy or use a service token, otherwise webhooks get redirected to a login page.
+- **Plain LAN + Basic auth.** Set `DASHBOARD_PASSWORD` and accept that Basic credentials are only as private as the network.
+
+Never put the dashboard behind a path that also serves webhooks without checking that policy bypass — a 302 to a login page reads as a delivery failure on GitLab.
+
 ## Concurrency and limits
 
 - Reviews run in a fixed worker pool (`MAX_WORKERS`); webhooks queue up to `QUEUE_SIZE` then get `503` so the platform retries. Ack is immediate (`202`) — a full queue is the only throttle.
