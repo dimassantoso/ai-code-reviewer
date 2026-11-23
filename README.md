@@ -104,6 +104,27 @@ docker compose logs -f reviewer
 
 Compose publishes only `127.0.0.1:9877` and forces the container listener to `0.0.0.0:9877`. Change the host side of `ports` if 9877 is occupied. For other container ports, update the port mapping and Docker healthcheck too. Use an HTTPS reverse proxy or tunnel to receive external webhooks; restrict access and retain signature verification.
 
+### Install the reviewer on another repo
+
+`make add` creates the webhook on the repo and proves it exists:
+
+```bash
+make add REPO=pasarpolis/newservice
+make add REPO=https://gitlab.com/pasarpolis/newservice
+make add REPO=owner/repo-on-github
+```
+
+It needs `PUBLIC_URL` in `.env` — the public base URL the platform calls, e.g.
+`https://reviewer.example.com`; the hook is pointed at `$PUBLIC_URL/gl-review` or
+`/gh-review`. GitLab gets `merge_requests_events` + `note_events` (push, tag, issue,
+wiki, pipeline, deployment and release events off); GitHub gets `pull_request`,
+`pull_request_review_comment` and `issue_comment`. Re-running on an installed repo
+**updates** the existing hook instead of creating a second one. Group/project and
+owner/repo are both accepted, from a slug, an HTTPS URL, an SSH URL or an MR/PR URL.
+
+`make reset` wipes review history — it asks first, writes a timestamped `.bak` next to
+the store, then restarts.
+
 ## Webhooks and behavior
 
 - GitLab: configure `https://<host>/gl-review` for merge request events. The server accepts `X-Gitlab-Token` or Standard Webhooks signing headers; `whsec_` secrets must contain valid base64.
