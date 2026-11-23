@@ -17,6 +17,9 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Tests must never write to a real review store: the deployed service exports
+# REVIEW_STORE, and inheriting it makes the suite append fixture rows to it.
+os.environ["REVIEW_STORE"] = ""
 import server  # noqa: E402
 
 # Ambient env must not change results: these three are module-level constants.
@@ -561,6 +564,14 @@ class SummaryCoverageTests(unittest.TestCase):
         body = server.review_body(review, "alice", "APPROVE", posted={("a.py", 1)})
         self.assertNotIn("a.py:1", body)
         self.assertIn("keep me", body)
+
+
+class StoreIsolationTests(unittest.TestCase):
+    """A test run must not touch the deployed review store."""
+
+    def test_suite_uses_no_store_path(self):
+        self.assertEqual(os.environ.get("REVIEW_STORE"), "")
+        self.assertEqual(server._tracker.path, "")
 
 
 class TrackerTests(unittest.TestCase):
