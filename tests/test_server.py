@@ -378,7 +378,8 @@ class ReviewOnlyOpenTests(unittest.TestCase):
 
     def run_with(self, payload, event="Merge Request Hook", job=None):
         seen = {}
-        job = job or {"base": "b", "token": "t", "path": "/p", "files": [{"new_path": "a.py", "diff": "@@ -0,0 +1 @@\n+x"}],
+        job = job or {"base": "b", "token": "t", "path": "/p", "pid": 1, "iid": 2,
+                      "files": [{"new_path": "a.py", "diff": "@@ -0,0 +1 @@\n+x"}],
                       "author": "alice", "header": "h", "level": 40, "draft": False,
                       "refs": {}, "head": "sha1", "diff": "@@ -0,0 +1 @@\n+x"}
         job["draft"] = bool(payload["object_attributes"].get("draft")) or job["draft"]  # as collected
@@ -386,6 +387,7 @@ class ReviewOnlyOpenTests(unittest.TestCase):
                 patch.object(server, "run_hermes", return_value="ok\nVERDICT: APPROVE") as hermes, \
                 patch.object(server, "api"), patch.object(server, "reviewer_of", return_value="bot"), \
                 patch.object(server, "gl_post_inline", return_value=set()), \
+                patch.object(server, "gl_resolve_fixed", return_value=0), \
                 patch.object(server, "superseded", return_value=False), \
                 patch.object(server, "gl_approve", return_value=True):
             result = server.process("gitlab", event, payload, self.GL_CONFIG,
@@ -428,7 +430,8 @@ class ReviewOnlyOpenTests(unittest.TestCase):
         self.assertIn("draft", seen["remark"])
 
     def test_wip_title_counts_as_draft(self):
-        job = {"base": "b", "token": "t", "path": "/p", "files": [{"new_path": "a.py", "diff": "@@ -0,0 +1 @@\n+x"}],
+        job = {"base": "b", "token": "t", "path": "/p", "pid": 1, "iid": 2,
+               "files": [{"new_path": "a.py", "diff": "@@ -0,0 +1 @@\n+x"}],
                "author": "alice", "header": "h", "level": 40, "draft": True,
                "refs": {}, "head": "sha1", "diff": "@@ -0,0 +1 @@\n+x"}
         result, seen, hermes = self.run_with(self.payload(action="open"), job=job)
@@ -1025,6 +1028,80 @@ class ReviewBudgetTests(unittest.TestCase):
         hermes.assert_not_called()
 
 
+class ResolveThreadTests(unittest.TestCase):
+    """The bot resolves its own threads whose finding is gone, and nothing else."""
+
+    REVIEW = "### Inline Comments\n- `a.py:10` WARNING: still broken.\n\nVERDICT: REQUEST_CHANGES"
+
+    def discussion(self, did="d1", author="santosodb", resolved=False,
+                   path="a.py", line=5, extra=None):
+        notes = [{"system": False, "author": {"username": author},
+                  "resolvable": True, "resolved": resolved,
+                  "position": {"new_path": path, "new_line": line}}]
+        if extra:
+            notes.append({"system": False, "author": {"username": extra}})
+        return {"id": did, "notes": notes}
+
+    def resolve(self, discussions):
+        calls = []
+
+        def fake_api_json(base, token, platform, path, body=None, accept="application/json"):
+            if body is not None:
+                calls.append((path, body))
+                return {}
+            return discussions
+
+        with patch.object(server, "api_json", side_effect=fake_api_json):
+            closed = server.gl_resolve_fixed("b", "t", 1, 2, self.REVIEW, "santosodb")
+        return closed, calls
+
+    def test_fixed_finding_is_resolved(self):
+        closed, calls = self.resolve([self.discussion(line=5)])
+        self.assertEqual(closed, 1)
+        self.assertEqual(calls, [("/projects/1/merge_requests/2/discussions/d1", {"resolved": "true"})])
+
+    def test_still_flagged_finding_stays_open(self):
+        closed, calls = self.resolve([self.discussion(line=10)])
+        self.assertEqual((closed, calls), (0, []))
+
+    def test_already_resolved_thread_is_left_alone(self):
+        closed, calls = self.resolve([self.discussion(resolved=True)])
+        self.assertEqual((closed, calls), (0, []))
+
+    def test_human_thread_is_not_touched(self):
+        closed, calls = self.resolve([self.discussion(author="alice")])
+        self.assertEqual((closed, calls), (0, []))
+
+    def test_thread_a_human_joined_is_left_open(self):
+        closed, calls = self.resolve([self.discussion(extra="alice")])
+        self.assertEqual((closed, calls), (0, []))
+
+    def test_only_our_threads_are_closed(self):
+        closed, calls = self.resolve([self.discussion(did="d1"), self.discussion(did="d2", author="alice")])
+        self.assertEqual(closed, 1)
+        self.assertEqual(len(calls), 1)
+
+    def test_unknown_position_is_not_guessed(self):
+        d = self.discussion()
+        d["notes"][0]["position"] = {}
+        closed, calls = self.resolve([d])
+        self.assertEqual((closed, calls), (0, []))
+
+    def test_api_failure_does_not_abort_the_review(self):
+        def fake_api_json(base, token, platform, path, body=None, accept="application/json"):
+            if body is not None:
+                raise server.URLError("down")
+            return [self.discussion(line=5)]
+
+        with patch.object(server, "api_json", side_effect=fake_api_json):
+            self.assertEqual(server.gl_resolve_fixed("b", "t", 1, 2, self.REVIEW, "santosodb"), 0)
+
+    def test_no_reviewer_identity_resolves_nothing(self):
+        with patch.object(server, "api_json") as api_json:
+            self.assertEqual(server.gl_resolve_fixed("b", "t", 1, 2, self.REVIEW, ""), 0)
+        api_json.assert_not_called()
+
+
 class ReviewerFlagTests(unittest.TestCase):
     """Comments distinguish the MR author from the reviewing bot."""
 
@@ -1553,7 +1630,7 @@ class StaleReviewTests(unittest.TestCase):
         self.assertEqual(posted, [])
 
     def test_superseded_helper_edge_cases(self):
-        job = {"base": "b", "token": "t", "path": "/p", "head": ""}
+        job = {"base": "b", "token": "t", "path": "/p", "pid": 1, "iid": 2, "head": ""}
         self.assertFalse(server.superseded("gitlab", job, self.CONFIG))  # unknown head: post anyway
         job["head"] = "sha"
         with patch.object(server, "api_json", return_value={}):

@@ -651,6 +651,52 @@ def gl_post_inline(base, token, path, review, changes, refs):
     return done
 
 
+def gl_resolve_fixed(base, token, pid, iid, review, me):
+    """Resolve our own inline threads whose finding is gone from the new review.
+
+    Only bot-authored, still-unresolved discussions are touched. A thread is closed when
+    its `file:line` no longer appears in the new findings — the code changed under it, so
+    leaving it open would keep a stale block on the MR forever. Threads already resolved
+    are skipped, and so are threads a human joined: if someone replied, the discussion is
+    theirs to close.
+    """
+    if not me:
+        return 0
+    findings = {(c["file"], c["line"]) for c in parse_inline_comments(review)}
+    discussions = api_json(base, token, "gitlab", f"/projects/{pid}/merge_requests/{iid}/discussions?per_page=100")
+    if not isinstance(discussions, list):
+        return 0
+    resolved = 0
+    for discussion in discussions:
+        notes = [n for n in (discussion.get("notes") or []) if not n.get("system")]
+        if not notes:
+            continue
+        first = notes[0]
+        author = (first.get("author") or {}).get("username", "")
+        if author != me:
+            continue  # not our thread
+        if not first.get("resolvable") or first.get("resolved"):
+            continue  # nothing to do, or already resolved
+        if any((n.get("author") or {}).get("username", "") != me for n in notes):
+            continue  # a human joined: leave it open for them
+        position = first.get("position") or {}
+        target = (position.get("new_path") or position.get("old_path") or "",
+                  position.get("new_line") or position.get("old_line"))
+        if not target[0] or target in findings:
+            continue  # unknown location, or the finding still stands
+        try:
+            api_json(base, token, "gitlab",
+                     f"/projects/{pid}/merge_requests/{iid}/discussions/{discussion['id']}",
+                     {"resolved": "true"})
+        except (HTTPError, URLError, ValueError, OSError) as error:
+            LOG.warning("could not resolve discussion %s: %s", discussion.get("id"), error)
+            continue
+        resolved += 1
+        LOG.info("resolved discussion %s (%s:%s no longer flagged)",
+                 discussion.get("id"), target[0], target[1])
+    return resolved
+
+
 def gl_approve(base, token, path, author):
     """Approve only when GitLab will actually allow it."""
     state = api_json(base, token, "gitlab", path + "/approvals")
@@ -902,7 +948,8 @@ def collect_gitlab(payload, config):
               f"Branch: {attrs.get('source_branch', '?')} -> {attrs.get('target_branch', '?')}\n"
               f"Description: {attrs.get('description') or '(none)'}\nFiles changed: {len(files)}\n\n"
               + REVIEW_FORMAT)
-    return {"base": base, "token": token, "path": path, "files": files, "author": author,
+    return {"base": base, "token": token, "path": path, "pid": pid, "iid": iid,
+            "files": files, "author": author,
             "header": header, "level": level, "draft": draft, "refs": meta.get("diff_refs") or {},
             "head": (meta.get("diff_refs") or {}).get("head_sha") or "",
             "diff": "\n".join(f"--- {c.get('new_path', c.get('old_path', ''))}\n{c.get('diff', '')}" for c in files)}
@@ -992,6 +1039,13 @@ def process(platform, event, payload, config, track=None):
     mark("posting", verdict=verdict)
     if platform == "gitlab":
         inline = gl_post_inline(job["base"], job["token"], job["path"], review, job["files"], job["refs"])
+        try:
+            closed = gl_resolve_fixed(job["base"], job["token"], job["pid"], job["iid"],
+                                      review, reviewer)
+            if closed:
+                mark("posting", remark="%d fixed finding(s) resolved" % closed)
+        except (HTTPError, URLError, ValueError, OSError) as error:
+            LOG.warning("could not resolve fixed findings: %s", error)
         api(job["base"], job["token"], "gitlab", job["path"] + "/notes",
             {"body": review_body(review, job["author"], verdict, posted=inline, reviewer=reviewer)})
         LOG.info("MR reviewed: verdict=%s inline=%d access=%s", verdict, len(inline), job["level"])
