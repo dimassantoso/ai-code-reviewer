@@ -148,10 +148,10 @@ class Tracker:
         except OSError:
             LOG.warning("review store %s unreadable, starting empty", self.path)
 
-    def begin(self, platform, target, author="", files=0):
+    def begin(self, platform, target, author="", files=0, url=""):
         with self.lock:
             self.seq += 1
-            rec = {"id": self.seq, "platform": platform, "target": target, "author": author,
+            rec = {"id": self.seq, "platform": platform, "target": target, "author": author, "url": url,
                    "status": "running", "stage": "queued", "started": time.time(),
                    "duration": 0.0, "verdict": "", "inline": 0, "files": files, "error": ""}
             self.live[self.seq] = rec
@@ -798,7 +798,8 @@ def worker():
 
 
 def run_job(platform, event, payload, cfg, raw, key):
-    rec = _tracker.begin(platform, label_of(platform, payload), author_of(payload))
+    rec = _tracker.begin(platform, label_of(platform, payload), author_of(payload),
+                         url=url_of(platform, payload))
     fields = {}
 
     def track(stage, **more):
@@ -838,6 +839,26 @@ def label_of(platform, payload):
         return "%s#%s" % (repo, payload.get("issue", {}).get("number") or payload.get("number", "?"))
     except (KeyError, TypeError, AttributeError):
         return "?"
+
+
+def url_of(platform, payload):
+    """Web URL of the MR/PR, so the dashboard can link straight to it."""
+    try:
+        if platform == "gitlab":
+            attrs = payload.get("object_attributes") or {}
+            if isinstance(attrs.get("url"), str) and attrs["url"].startswith("https://"):
+                return attrs["url"]
+            project = payload.get("project") or {}
+            web = project.get("web_url") or ""
+            iid = attrs.get("iid") or (payload.get("merge_request") or {}).get("iid")
+            if web.startswith("https://") and iid:
+                return "%s/-/merge_requests/%s" % (web.rstrip("/"), iid)
+            return ""
+        pr = payload.get("pull_request") or {}
+        html = pr.get("html_url") or (payload.get("issue") or {}).get("html_url") or ""
+        return html if isinstance(html, str) and html.startswith("https://") else ""
+    except (KeyError, TypeError, AttributeError):
+        return ""
 
 
 def author_of(payload):

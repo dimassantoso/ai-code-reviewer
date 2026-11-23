@@ -26,6 +26,8 @@
   tr:last-child td { border-bottom:none; }
   td.num { font-variant-numeric:tabular-nums; }
   .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
+  a { color:var(--accent); text-decoration:none; }
+  a:hover { text-decoration:underline; }
   .pill { display:inline-block; padding:1px 7px; border-radius:10px; font-size:11px; font-weight:600; }
   .pill.done { background:rgba(63,185,80,.15); color:var(--ok); }
   .pill.failed { background:rgba(248,81,73,.15); color:var(--bad); }
@@ -71,6 +73,9 @@
 <script>
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const secs = n => n >= 60 ? Math.floor(n / 60) + "m " + Math.round(n % 60) + "s" : (n || 0).toFixed(1) + "s";
+const link = (label, url) => url && /^https:\/\//.test(url)
+  ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(label)}</a>`
+  : esc(label);
 const when = t => new Date(t * 1000).toLocaleString(undefined, {month:"short", day:"numeric", hour:"2-digit", minute:"2-digit"});
 
 async function tick() {
@@ -88,13 +93,13 @@ async function tick() {
     set("s-failed", s.failed, "bad");
 
     document.getElementById("live").innerHTML = d.live.length ? d.live.map(j => `<tr>
-      <td class="mono">${esc(j.target)}</td><td>${esc(j.platform)}</td><td>${esc(j.stage)}</td>
+      <td class="mono">${link(j.target, j.url)}</td><td>${esc(j.platform)}</td><td>${esc(j.stage)}</td>
       <td class="num">${secs(j.elapsed)}</td>
       <td><div class="bar"><i style="width:${j.pct}%"></i></div></td></tr>`).join("")
       : '<tr><td colspan="5" class="empty">idle</td></tr>';
 
     document.getElementById("hist").innerHTML = d.history.length ? d.history.slice(0, 50).map(h => `<tr>
-      <td class="num">${when(h.started)}</td><td class="mono">${esc(h.target)}</td>
+      <td class="num">${when(h.started)}</td><td class="mono">${link(h.target, h.url)}</td>
       <td>${esc(h.author) || "–"}</td>
       <td>${h.verdict ? `<span class="pill ${esc(h.verdict)}">${esc(h.verdict)}</span>` : "–"}</td>
       <td class="num">${h.inline || 0}</td><td class="num">${secs(h.duration)}</td>

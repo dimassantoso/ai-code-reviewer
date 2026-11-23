@@ -618,6 +618,37 @@ class TrackerTests(unittest.TestCase):
         self.assertEqual([r["target"] for r in snap["history"]], ["ok"])
 
 
+class LinkTests(unittest.TestCase):
+    def test_gitlab_url_prefers_payload_url(self):
+        payload = {"project": {"web_url": "https://gitlab.com/g/p"},
+                   "object_attributes": {"iid": 7, "url": "https://gitlab.com/g/p/-/merge_requests/7"}}
+        self.assertEqual(server.url_of("gitlab", payload), "https://gitlab.com/g/p/-/merge_requests/7")
+
+    def test_gitlab_url_built_when_absent(self):
+        payload = {"project": {"web_url": "https://gitlab.com/g/p"},
+                   "object_attributes": {"iid": 7}}
+        self.assertEqual(server.url_of("gitlab", payload), "https://gitlab.com/g/p/-/merge_requests/7")
+
+    def test_gitlab_note_event_builds_url(self):
+        payload = {"project": {"web_url": "https://gitlab.com/g/p"},
+                   "object_kind": "note", "merge_request": {"iid": 3}}
+        self.assertEqual(server.url_of("gitlab", payload), "https://gitlab.com/g/p/-/merge_requests/3")
+
+    def test_github_url_from_pull_request(self):
+        payload = {"pull_request": {"html_url": "https://github.com/a/b/pull/12"}}
+        self.assertEqual(server.url_of("github", payload), "https://github.com/a/b/pull/12")
+
+    def test_missing_or_non_https_url_is_blank(self):
+        self.assertEqual(server.url_of("gitlab", {}), "")
+        self.assertEqual(server.url_of("github", {"pull_request": {"html_url": "javascript:alert(1)"}}), "")
+
+    def test_record_carries_url(self):
+        tracker = server.Tracker(os.path.join(tempfile.mkdtemp(), "r.jsonl"))
+        rec = tracker.begin("github", "a/b#1", url="https://github.com/a/b/pull/1")
+        tracker.finish(rec)
+        self.assertEqual(tracker.snapshot()["history"][0]["url"], "https://github.com/a/b/pull/1")
+
+
 class DashboardTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
