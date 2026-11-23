@@ -72,7 +72,32 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 
+API_ATTEMPTS = int(os.getenv("API_ATTEMPTS", "3"))  # transient network errors only
+TRANSIENT = (ConnectionError, TimeoutError)  # ConnectionResetError/Aborted/Refused, socket timeout
+
+
 def api(base, token, platform, path, body=None, accept="application/json"):
+    """Call the platform API, retrying connection resets instead of failing the review.
+
+    A reset mid-review used to mark the whole review failed. It is almost always
+    the network, not the request, so the same call is retried with a short backoff.
+    HTTP errors are never retried: a 401 or 404 will not fix itself.
+    """
+    for attempt in range(1, API_ATTEMPTS + 1):
+        try:
+            return api_once(base, token, platform, path, body, accept)
+        except URLError as error:
+            if not isinstance(error.reason, TRANSIENT) or attempt == API_ATTEMPTS:
+                raise
+            LOG.info("api %s reset (%s), retry %d/%d", path, error.reason, attempt, API_ATTEMPTS - 1)
+        except TRANSIENT as error:
+            if attempt == API_ATTEMPTS:
+                raise
+            LOG.info("api %s reset (%s), retry %d/%d", path, error, attempt, API_ATTEMPTS - 1)
+        time.sleep(0.5 * attempt)
+
+
+def api_once(base, token, platform, path, body=None, accept="application/json"):
     headers = {"Accept": accept, "User-Agent": "hermes-review-server"}
     headers["PRIVATE-TOKEN" if platform == "gitlab" else "Authorization"] = token if platform == "gitlab" else "Bearer " + token
     data = None if body is None else json.dumps(body).encode()

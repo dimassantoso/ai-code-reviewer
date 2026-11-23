@@ -13,7 +13,7 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -564,6 +564,44 @@ class SummaryCoverageTests(unittest.TestCase):
         body = server.review_body(review, "alice", "APPROVE", posted={("a.py", 1)})
         self.assertNotIn("a.py:1", body)
         self.assertIn("keep me", body)
+
+
+class ApiRetryTests(unittest.TestCase):
+    """A dropped connection must not fail the review; a bad response must."""
+
+    def test_connection_reset_is_retried(self):
+        ok = b'{"id": 1}'
+        with patch.object(server, "api_once", side_effect=[ConnectionResetError(104, "reset"), ok]) as once, \
+                patch.object(server.time, "sleep"):
+            self.assertEqual(server.api("https://x", "t", "gitlab", "/p"), ok)
+        self.assertEqual(once.call_count, 2)
+
+    def test_urlerror_wrapping_reset_is_retried(self):
+        ok = b"[]"
+        reset = URLError(ConnectionResetError(104, "reset"))
+        with patch.object(server, "api_once", side_effect=[reset, ok]), patch.object(server.time, "sleep"):
+            self.assertEqual(server.api("https://x", "t", "github", "/p"), ok)
+
+    def test_gives_up_after_last_attempt(self):
+        with patch.object(server, "api_once", side_effect=ConnectionResetError(104, "reset")) as once, \
+                patch.object(server.time, "sleep"):
+            with self.assertRaises(ConnectionResetError):
+                server.api("https://x", "t", "gitlab", "/p")
+        self.assertEqual(once.call_count, server.API_ATTEMPTS)
+
+    def test_http_error_is_not_retried(self):
+        error = HTTPError("https://x/p", 401, "Unauthorized", {}, None)
+        with patch.object(server, "api_once", side_effect=error) as once, patch.object(server.time, "sleep"):
+            with self.assertRaises(HTTPError):
+                server.api("https://x", "t", "github", "/p")
+        self.assertEqual(once.call_count, 1)
+
+    def test_bad_http_status_inside_urlopen_is_not_retried(self):
+        error = URLError(HTTPError("https://x/p", 404, "Not Found", {}, None))
+        with patch.object(server, "api_once", side_effect=error) as once, patch.object(server.time, "sleep"):
+            with self.assertRaises(URLError):
+                server.api("https://x", "t", "gitlab", "/p")
+        self.assertEqual(once.call_count, 1)
 
 
 class StoreIsolationTests(unittest.TestCase):

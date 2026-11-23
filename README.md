@@ -52,6 +52,7 @@ Copy `.env.example` to `.env` and fill in at least one platform token and its we
 | `APPROVE_ACCESS_LEVEL` | Access level required for auto-approve. Default `40` (Maintainer). |
 | `COOLDOWN_SECONDS` | Per-user per-thread debate cooldown. Default `30`. |
 | `MAX_INLINE` | Inline comments posted per review. Default `20`. |
+| `API_ATTEMPTS` | Tries per platform API call when the connection resets. Default `3`. HTTP errors are never retried. |
 | `MAX_DEBATE_DIFF` | Diff characters handed to a debate reply. Default `20000`. |
 | `DASHBOARD_USER`, `DASHBOARD_PASSWORD` | HTTP Basic auth for `/dashboard` and `/api/reviews`. Blank password leaves them open; the browser shows its own login prompt, so no token in the URL. |
 | `REVIEW_STORE` | Optional JSONL path for review history. Unset keeps history in memory only (lost on restart). |
@@ -115,6 +116,7 @@ Compose publishes only `127.0.0.1:9877` and forces the container listener to `0.
 - A review whose head commit moved while the model was thinking is discarded, so a stale verdict never lands on newer code.
 - A target whose head SHA was already reviewed is skipped. This is what stops the approve -> update event -> approve loop: our own approval fires a fresh MR event with identical code. Push a new commit and the head changes, so it is reviewed again. The memory is in-process (cleared on restart).
 - Debate: a GitLab note or GitHub comment that `@BOT_USERNAME` and is not our own reply gets an in-thread answer. Per-note dedupe, per-thread cooldown (`COOLDOWN_SECONDS`), a bounded transcript of that discussion, and the diff under discussion (up to `MAX_DEBATE_DIFF`); GitLab additionally requires `MIN_ACCESS_LEVEL`. Bot and `[bot]` authors are ignored. Blank `BOT_USERNAME` disables it.
+- A dropped connection (`Connection reset by peer`) during a platform API call is retried up to `API_ATTEMPTS` times with a short backoff instead of failing the review. HTTP errors (401/404) are not retried.
 - Diffs over 100,000 characters are rejected rather than silently truncated. API and Hermes errors are logged; retries and persistence are not guaranteed after acknowledgement.
 
 Review input is untrusted. The service requests empty Hermes toolsets and strips platform credentials from the CLI child environment, but use a dedicated least-privilege account and review model output before acting on it.
