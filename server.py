@@ -191,7 +191,8 @@ class Tracker:
                 if rec["stage"] == "reviewing":
                     pct = min(85, 25 + 60 * elapsed / self.est)
                 live.append(dict(rec, elapsed=round(elapsed, 1), pct=round(pct)))
-            done = [dict(r) for r in self.done]
+            done = sorted((dict(r) for r in self.done),
+                          key=lambda r: r.get("started") or 0, reverse=True)
         live.sort(key=lambda r: r["id"])
         return {"live": live, "history": done, "stats": stats_of(done, live, now)}
 

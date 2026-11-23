@@ -600,6 +600,12 @@ class TrackerTests(unittest.TestCase):
         self.assertEqual(snap["stats"]["failed"], 1)
         self.assertEqual(snap["history"][0]["error"], "diff too large for one review")
 
+    def test_history_is_newest_first(self):
+        for i in range(3):
+            self.t.finish(self.t.begin("gitlab", "g/p!%d" % i))
+        hist = self.t.snapshot()["history"]
+        self.assertEqual([r["target"] for r in hist], ["g/p!2", "g/p!1", "g/p!0"])
+
     def test_history_is_bounded(self):
         for i in range(8):
             self.t.finish(self.t.begin("gitlab", "g/p!%d" % i))
