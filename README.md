@@ -127,6 +127,22 @@ python3 tests/loadtest.py --requests 200 --concurrency 32 --workers 4
 
 Tests use mocks and do not prove platform credentials, network access or model readiness.
 
+## Operating it
+
+`make` lists every target. The ones you will actually use on the box:
+
+```
+make restart     # after editing .env or pulling code
+make health      # 200 check against the MagicDNS name
+make dash        # dashboard URL + where the password lives
+make log         # last 100 lines of server.log
+make logs        # stream server.log
+make password NEW=secret   # rewrite DASHBOARD_PASSWORD and restart
+make deploy      # git pull origin/master, restart, health check
+```
+
+`make` resolves the host from `tailscale status` (MagicDNS name), so the printed URL keeps working when the tailnet IP changes.
+
 ## Dashboard and access
 
 `GET /dashboard` shows live reviews (stage, elapsed, progress), totals, average and p95 duration, verdict counts and history. `GET /api/reviews` is the same data as JSON.

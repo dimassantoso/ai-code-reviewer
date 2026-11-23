@@ -48,14 +48,7 @@ logs:  ## stream the log (ctrl-c to stop)
 
 password:  ## set the dashboard password: make password NEW=secret
 	@test -n "$(NEW)" || { echo 'usage: make password NEW=secret'; exit 1; }
-	@python3 - "$(ENV)" "$(NEW)" <<-'PY'
-	import pathlib, sys
-	path, value = pathlib.Path(sys.argv[1]), sys.argv[2]
-	lines = [l for l in path.read_text().splitlines() if not l.startswith("DASHBOARD_PASSWORD=")]
-	lines.append("DASHBOARD_PASSWORD=" + value)
-	path.write_text("\n".join(lines) + "\n")
-	path.chmod(0o600)
-	PY
+	@python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); ls=[l for l in p.read_text().splitlines() if not l.startswith("DASHBOARD_PASSWORD=")]; p.write_text("\n".join(ls+["DASHBOARD_PASSWORD="+sys.argv[2]])+"\n"); p.chmod(0o600)' "$(ENV)" "$(NEW)"
 	@$(MAKE) --no-print-directory restart
 
 test:  ## run the test suite
