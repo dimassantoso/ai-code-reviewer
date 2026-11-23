@@ -327,6 +327,41 @@ class EndToEndTests(unittest.TestCase):
             self.assertIn("part 1 of", handle.read())
 
 
+class AllowlistTests(unittest.TestCase):
+
+    def setUp(self):
+        server._reviewed.clear()
+        server._seen.clear()
+    """REVIEW_REPOS restricts which repos get reviewed."""
+
+    GL = {"object_kind": "merge_request", "project": {"id": 1, "path_with_namespace": "acme/widgets"},
+          "object_attributes": {"iid": 2, "action": "open"}}
+
+    def test_empty_allowlist_reviews_everything(self):
+        self.assertTrue(server.repo_enabled("gitlab", self.GL))
+
+    def test_listed_repo_is_enabled_case_insensitively(self):
+        with patch.object(server, "REVIEW_REPOS", {"acme/widgets"}):
+            self.assertTrue(server.repo_enabled("gitlab", self.GL))
+            self.assertTrue(server.repo_enabled("gitlab", {"project": {"path_with_namespace": "ACME/Widgets"}}))
+
+    def test_unlisted_repo_is_refused_with_a_remark(self):
+        seen = {}
+        with patch.object(server, "REVIEW_REPOS", {"acme/other"}), patch.object(server, "run_hermes") as hermes:
+            self.assertFalse(server.process("gitlab", "Merge Request Hook", self.GL,
+                                            {"token": "t", "secret": "s"},
+                                            lambda stage, **kw: seen.update(kw)))
+        hermes.assert_not_called()
+        self.assertIn("not in REVIEW_REPOS", seen["remark"])
+        self.assertIn("acme/widgets", seen["remark"])
+
+    def test_github_repo_name(self):
+        payload = {"repository": {"full_name": "acme/widgets"}}
+        with patch.object(server, "REVIEW_REPOS", {"acme/widgets"}):
+            self.assertEqual(server.repo_of("github", payload), "acme/widgets")
+            self.assertTrue(server.repo_enabled("github", payload))
+
+
 class TriggerFilterTests(unittest.TestCase):
     """Non-review webhooks are acknowledged and dropped: no dashboard row."""
 

@@ -28,6 +28,8 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "")
 MIN_ACCESS_LEVEL = int(os.getenv("MIN_ACCESS_LEVEL", "30"))      # 30=Developer
 APPROVE_ACCESS_LEVEL = int(os.getenv("APPROVE_ACCESS_LEVEL", "40"))  # 40=Maintainer
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "30"))
+# Comma-separated group/project or owner/repo. Empty = every repo is reviewed.
+REVIEW_REPOS = {r.strip().lower() for r in os.getenv("REVIEW_REPOS", "").split(",") if r.strip()}
 MAX_DEBATE_DIFF = 20_000  # diff context handed to a debate reply
 MAX_INLINE = int(os.getenv("MAX_INLINE", "20"))  # inline comments posted per review
 DASHBOARD_USER = os.getenv("DASHBOARD_USER", "admin")
@@ -913,6 +915,9 @@ def process(platform, event, payload, config, track=None):
 
     if not isinstance(payload, dict):
         raise ValueError("invalid payload")
+    if not repo_enabled(platform, payload):
+        return skip("%s is not in REVIEW_REPOS (make add %s)"
+                    % (repo_of(platform, payload) or "this repo", repo_of(platform, payload) or "<repo>"))
     if platform == "gitlab":
         attrs = payload.get("object_attributes")
         if event != "Merge Request Hook" or payload.get("object_kind") != "merge_request":
@@ -1135,6 +1140,25 @@ def triggers_review(platform, event, payload):
         return event == "pull_request" and payload.get("action") in PR_ACTIONS
     except (AttributeError, TypeError):
         return False
+
+
+def repo_of(platform, payload):
+    """`group/project` or `owner/repo` for this event, lowercased."""
+    try:
+        if platform == "gitlab":
+            name = (payload.get("project") or {}).get("path_with_namespace") or ""
+        else:
+            name = (payload.get("repository") or {}).get("full_name") or ""
+    except AttributeError:
+        return ""
+    return name.strip().strip("/").lower()
+
+
+def repo_enabled(platform, payload):
+    """True unless REVIEW_REPOS is set and this repo is not listed."""
+    if not REVIEW_REPOS:
+        return True
+    return repo_of(platform, payload) in REVIEW_REPOS
 
 
 def is_note_event(platform, payload):

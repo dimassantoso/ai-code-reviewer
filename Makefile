@@ -5,6 +5,7 @@ UNIT  := pasarpolis-ai-code-reviewer
 DIR   := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 ENV   := $(DIR)/.env
 LOG   := $(DIR)/server.log
+STORE := $(DIR)/$(patsubst ./%,%,$(or $(shell grep -m1 '^REVIEW_STORE=' $(ENV) 2>/dev/null | cut -d= -f2),reviews.jsonl))
 PORT  := $(or $(shell grep -m1 '^BIND_PORT=' $(ENV) 2>/dev/null | cut -d= -f2 | cut -d, -f1),9877)
 # Prefer the MagicDNS name (survives IP changes), fall back to the tailnet IP.
 HOST  := $(or $(shell tailscale status --json 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))' 2>/dev/null),$(or $(shell tailscale ip -4 2>/dev/null | head -1),127.0.0.1))
@@ -12,7 +13,7 @@ SC    := systemctl --user
 export XDG_RUNTIME_DIR ?= /run/user/$(shell id -u)
 
 .DEFAULT_GOAL := help
-.PHONY: help start stop restart status health dash url log logs password test deploy
+.PHONY: help start stop restart status health dash url log logs password test deploy reset add
 
 help:  ## list targets
 	@grep -E '^[a-z]+:.*## ' $(MAKEFILE_LIST) | sed 's/:.*## /\t/' | column -t -s "$$(printf '\t')"
@@ -45,6 +46,16 @@ log:  ## last 100 log lines
 
 logs:  ## stream the log (ctrl-c to stop)
 	@tail -f -n 50 $(LOG)
+
+reset:  ## wipe review history (asks first; keeps a backup)
+	@test -f $(STORE) || { echo "no store at $(STORE)"; exit 1; }
+	@printf 'Delete all %s review records and restart? [y/N] ' "$$(wc -l < $(STORE))"; read ans; \
+	 case "$$ans" in y|Y) cp $(STORE) $(STORE).$$(date +%Y%m%d-%H%M%S).bak && : > $(STORE) && echo "cleared $(STORE)";; *) echo aborted; exit 1;; esac
+	@$(MAKE) --no-print-directory restart
+
+add:  ## install the reviewer on a repo: make add REPO=group/project
+	@test -n "$(REPO)" || { echo 'usage: make add REPO=group/project'; exit 1; }
+	@cd $(DIR) && python3 tools/add_repo.py "$(REPO)"
 
 password:  ## set the dashboard password: make password NEW=secret
 	@test -n "$(NEW)" || { echo 'usage: make password NEW=secret'; exit 1; }
