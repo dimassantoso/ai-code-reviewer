@@ -303,7 +303,7 @@ class EndToEndTests(unittest.TestCase):
         ApiStub.notes.clear()
         raw = json.dumps({"object_kind": "push", "project": {"id": 1}}).encode()
         status, body = self.post(raw, {"X-Gitlab-Token": SECRET, "X-Gitlab-Event": "Push Hook"})
-        self.assertEqual((status, body), (202, "accepted"))
+        self.assertEqual((status, body), (200, "ignored"))
         self.assertFalse(self.wait_for_notes(timeout=1))
         self.assertEqual(ApiStub.notes, [])
 
@@ -325,6 +325,36 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("MR author: @alice", body)
         with open(self.hermes + ".stdin") as handle:
             self.assertIn("part 1 of", handle.read())
+
+
+class TriggerFilterTests(unittest.TestCase):
+    """Non-review webhooks are acknowledged and dropped: no dashboard row."""
+
+    def test_push_hook_is_filtered_out(self):
+        self.assertFalse(server.triggers_review("gitlab", "Push Hook", {"object_kind": "push"}))
+
+    def test_merge_request_open_update_reopen_trigger(self):
+        for action in ("open", "update", "reopen"):
+            payload = {"object_kind": "merge_request", "object_attributes": {"action": action, "iid": 1}}
+            self.assertTrue(server.triggers_review("gitlab", "Merge Request Hook", payload), action)
+
+    def test_closed_merge_request_is_filtered_out(self):
+        payload = {"object_kind": "merge_request", "object_attributes": {"action": "close", "iid": 1}}
+        self.assertFalse(server.triggers_review("gitlab", "Merge Request Hook", payload))
+
+    def test_note_event_still_triggers_debate(self):
+        payload = {"object_kind": "note", "object_attributes": {"noteable_type": "MergeRequest", "note": "@bot hi"}}
+        self.assertTrue(server.triggers_review("gitlab", "Note Hook", payload))
+
+    def test_github_pr_actions(self):
+        for action in ("opened", "synchronize", "reopened"):
+            self.assertTrue(server.triggers_review("github", "pull_request", {"action": action}))
+        self.assertFalse(server.triggers_review("github", "pull_request", {"action": "closed"}))
+        self.assertFalse(server.triggers_review("github", "push", {"action": "opened"}))
+
+    def test_garbage_payload_is_filtered_out(self):
+        self.assertFalse(server.triggers_review("gitlab", "Merge Request Hook", {"object_kind": "merge_request"}))
+        self.assertFalse(server.triggers_review("gitlab", "Merge Request Hook", {}))
 
 
 class IsolatedCase(unittest.TestCase):

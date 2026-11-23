@@ -1111,6 +1111,32 @@ def author_of(payload):
         return ""
 
 
+REVIEW_ACTIONS = {"open", "update", "reopen"}
+PR_ACTIONS = {"opened", "synchronize", "reopened"}
+
+
+def triggers_review(platform, event, payload):
+    """True when this webhook can produce a review or a debate reply.
+
+    Everything else — push hooks, MR close/label events, unrelated CI hooks — is
+    acknowledged and dropped. The dashboard records reviews, not noise.
+    """
+    if not isinstance(payload, dict):
+        return False
+    try:
+        if is_note_event(platform, payload):
+            return True
+        if platform == "gitlab":
+            attrs = payload.get("object_attributes")
+            return (event == "Merge Request Hook"
+                    and payload.get("object_kind") == "merge_request"
+                    and isinstance(attrs, dict)
+                    and attrs.get("action") in REVIEW_ACTIONS)
+        return event == "pull_request" and payload.get("action") in PR_ACTIONS
+    except (AttributeError, TypeError):
+        return False
+
+
 def is_note_event(platform, payload):
     if not isinstance(payload, dict):
         return False
@@ -1253,6 +1279,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(403, "invalid signature")
             payload = json.loads(raw)
             event = self.headers.get("X-Gitlab-Event" if platform == "gitlab" else "X-GitHub-Event", "")
+            if not triggers_review(platform, event, payload):
+                LOG.info("%s %s does not trigger a review, dropped", platform, event or "no event")
+                return self.respond(200, "ignored")
             if not claim(platform, raw):
                 return self.respond(200, "duplicate")
             # Ack before the slow review: GitLab/GitHub time out webhooks at 10s.
