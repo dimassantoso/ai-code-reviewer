@@ -6,12 +6,13 @@ DIR   := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 ENV   := $(DIR)/.env
 LOG   := $(DIR)/server.log
 PORT  := $(or $(shell grep -m1 '^BIND_PORT=' $(ENV) 2>/dev/null | cut -d= -f2 | cut -d, -f1),9877)
-IP    := $(or $(shell tailscale ip -4 2>/dev/null | head -1),127.0.0.1)
+# Prefer the MagicDNS name (survives IP changes), fall back to the tailnet IP.
+HOST  := $(or $(shell tailscale status --json 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))' 2>/dev/null),$(or $(shell tailscale ip -4 2>/dev/null | head -1),127.0.0.1))
 SC    := systemctl --user
 export XDG_RUNTIME_DIR ?= /run/user/$(shell id -u)
 
 .DEFAULT_GOAL := help
-.PHONY: help start stop restart status health dash log logs password test deploy
+.PHONY: help start stop restart status health dash url log logs password test deploy
 
 help:  ## list targets
 	@grep -E '^[a-z]+:.*## ' $(MAKEFILE_LIST) | sed 's/:.*## /\t/' | column -t -s "$$(printf '\t')"
@@ -30,11 +31,14 @@ status:  ## unit state plus listeners
 	@ss -ltnp 2>/dev/null | grep -E ':($(PORT)|9876)\b' || echo "not listening"
 
 health:  ## HTTP check on the tailnet address
-	@curl -fsS -o /dev/null -w 'health=%{http_code}  $(IP):$(PORT)\n' http://$(IP):$(PORT)/health
+	@curl -fsS -o /dev/null -w 'health=%{http_code}  $(HOST):$(PORT)\n' http://$(HOST):$(PORT)/health
 
-dash:  ## print the dashboard URL
-	@echo "http://$(IP):$(PORT)/dashboard"
-	@echo "login: $$(grep -m1 '^DASHBOARD_USER=' $(ENV) | cut -d= -f2) / see DASHBOARD_PASSWORD in $(ENV)"
+dash:  ## print the dashboard URL and login
+	@echo "http://$(HOST):$(PORT)/dashboard"
+	@echo "login: $$(grep -m1 '^DASHBOARD_USER=' $(ENV) | cut -d= -f2) / password: grep '^DASHBOARD_PASSWORD=' $(ENV)"
+
+url:  ## just the dashboard URL (for copy-paste)
+	@echo "http://$(HOST):$(PORT)/dashboard"
 
 log:  ## last 100 log lines
 	@tail -n 100 $(LOG)
