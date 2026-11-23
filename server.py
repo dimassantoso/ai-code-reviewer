@@ -168,6 +168,8 @@ class Tracker:
                     except ValueError:
                         continue
                     if isinstance(rec, dict) and "id" in rec:
+                        if rec.get("target") in ("", "?", None) and rec.get("url"):
+                            rec["target"] = label_from_url(rec["url"]) or rec["target"]
                         self.done.appendleft(rec)
                         self.seq = max(self.seq, int(rec["id"]))
         except OSError:
@@ -221,6 +223,21 @@ class Tracker:
                           key=lambda r: r.get("started") or 0, reverse=True)
         live.sort(key=lambda r: r["id"])
         return {"live": live, "history": done, "stats": stats_of(done, live, now)}
+
+
+def label_from_url(url):
+    """Rebuild `group/project!12` / `owner/repo#7` from a stored MR/PR URL.
+
+    Old records were written before the target was captured, so they render as
+    `?`. The URL is in the record, so the label is recoverable without a re-review.
+    """
+    match = re.match(r"https://[^/]+/(.+?)/-/merge_requests/(\d+)", url or "")
+    if match:
+        return "%s!%s" % (match.group(1), match.group(2))
+    match = re.match(r"https://[^/]+/(.+?)/pull/(\d+)", url or "")
+    if match:
+        return "%s#%s" % (match.group(1), match.group(2))
+    return ""
 
 
 def stats_of(done, live, now):
@@ -869,18 +886,23 @@ def run_job(platform, event, payload, cfg, raw, key):
 
 
 def label_of(platform, payload):
-    """Short human label for the dashboard, e.g. `group/project!12` or `owner/repo#7`."""
+    """Short human label for the dashboard, e.g. `group/project!12` or `owner/repo#7`.
+
+    Note/comment events carry the MR under `merge_request` / `pull_request`, not
+    under `object_attributes`, so they are resolved first — otherwise a debate
+    reply logged its target as `?`.
+    """
     try:
         if platform == "gitlab":
-            attrs = payload["object_attributes"]
-            name = (payload.get("project") or {}).get("path_with_namespace") or str(payload["project"]["id"])
-            return "%s!%s" % (name, attrs["iid"])
-        if payload.get("object_kind") == "note":
-            mr = payload["merge_request"]
-            name = (payload.get("project") or {}).get("path_with_namespace") or str(payload["project"]["id"])
-            return "%s!%s" % (name, mr["iid"])
+            project = payload.get("project") or {}
+            name = project.get("path_with_namespace") or str(project.get("id"))
+            if payload.get("object_kind") == "note":
+                return "%s!%s" % (name, (payload.get("merge_request") or {})["iid"])
+            return "%s!%s" % (name, payload["object_attributes"]["iid"])
         repo = (payload.get("repository") or {}).get("full_name") or "?"
-        return "%s#%s" % (repo, payload.get("issue", {}).get("number") or payload.get("number", "?"))
+        if "pull_request" in payload:
+            return "%s#%s" % (repo, payload["pull_request"]["number"])
+        return "%s#%s" % (repo, (payload.get("issue") or {}).get("number", "?"))
     except (KeyError, TypeError, AttributeError):
         return "?"
 
@@ -890,8 +912,9 @@ def url_of(platform, payload):
     try:
         if platform == "gitlab":
             attrs = payload.get("object_attributes") or {}
-            if isinstance(attrs.get("url"), str) and attrs["url"].startswith("https://"):
-                return attrs["url"]
+            url = attrs.get("url")
+            if isinstance(url, str) and url.startswith("https://"):
+                return url.split("#")[0]  # a note URL would deep-link to the comment, not the MR
             project = payload.get("project") or {}
             web = project.get("web_url") or ""
             iid = attrs.get("iid") or (payload.get("merge_request") or {}).get("iid")

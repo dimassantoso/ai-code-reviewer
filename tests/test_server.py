@@ -677,6 +677,34 @@ class TrackerTests(unittest.TestCase):
         self.assertEqual([r["target"] for r in snap["history"]], ["ok"])
 
 
+class LabelTests(unittest.TestCase):
+    """Every real event shape must produce a readable target, never `?`."""
+
+    def test_gitlab_merge_request(self):
+        payload = {"object_kind": "merge_request", "project": {"path_with_namespace": "g/p"},
+                   "object_attributes": {"iid": 12}}
+        self.assertEqual(server.label_of("gitlab", payload), "g/p!12")
+
+    def test_gitlab_note_event_uses_merge_request(self):
+        payload = {"object_kind": "note", "project": {"path_with_namespace": "pasarpolis/integrationservice"},
+                   "merge_request": {"iid": 4895}}
+        self.assertEqual(server.label_of("gitlab", payload), "pasarpolis/integrationservice!4895")
+
+    def test_github_pull_request_event(self):
+        payload = {"repository": {"full_name": "a/b"}, "number": 7,
+                   "pull_request": {"number": 7}}
+        self.assertEqual(server.label_of("github", payload), "a/b#7")
+
+    def test_github_comment_event(self):
+        payload = {"repository": {"full_name": "a/b"}, "issue": {"number": 9},
+                   "comment": {"id": 1}}
+        self.assertEqual(server.label_of("github", payload), "a/b#9")
+
+    def test_unparseable_payload_still_returns_a_label(self):
+        self.assertEqual(server.label_of("gitlab", {}), "?")
+        self.assertEqual(server.label_of("github", {"repository": {}}), "?#?")
+
+
 class LinkTests(unittest.TestCase):
     def test_gitlab_url_prefers_payload_url(self):
         payload = {"project": {"web_url": "https://gitlab.com/g/p"},
@@ -700,6 +728,22 @@ class LinkTests(unittest.TestCase):
     def test_missing_or_non_https_url_is_blank(self):
         self.assertEqual(server.url_of("gitlab", {}), "")
         self.assertEqual(server.url_of("github", {"pull_request": {"html_url": "javascript:alert(1)"}}), "")
+
+    def test_note_url_is_trimmed_to_the_mr(self):
+        payload = {"object_attributes": {"url": "https://gitlab.com/g/p/-/merge_requests/5#note_99"}}
+        self.assertEqual(server.url_of("gitlab", payload), "https://gitlab.com/g/p/-/merge_requests/5")
+
+    def test_label_from_url(self):
+        self.assertEqual(server.label_from_url("https://gitlab.com/g/p/-/merge_requests/12"), "g/p!12")
+        self.assertEqual(server.label_from_url("https://github.com/a/b/pull/7"), "a/b#7")
+        self.assertEqual(server.label_from_url("https://example.com/nope"), "")
+
+    def test_old_record_without_target_is_repaired_on_load(self):
+        path = os.path.join(tempfile.mkdtemp(), "r.jsonl")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"id": 3, "target": "?", "status": "done",
+                                 "url": "https://gitlab.com/g/p/-/merge_requests/12"}) + "\n")
+        self.assertEqual(server.Tracker(path).snapshot()["history"][0]["target"], "g/p!12")
 
     def test_record_carries_url(self):
         tracker = server.Tracker(os.path.join(tempfile.mkdtemp(), "r.jsonl"))
