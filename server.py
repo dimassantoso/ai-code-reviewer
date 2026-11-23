@@ -1014,6 +1014,8 @@ def process(platform, event, payload, config, track=None):
         job = collect_github(payload, config)
     if isinstance(job, str):  # collector refused: it returns the reason
         return skip(job)
+    if job.get("author"):
+        mark("collecting", author=job["author"])  # GitLab hooks carry only author_id; the API knows
     if not job:
         return skip("nothing to review")
     if platform == "github" and (job.get("merged") or (job.get("state") or "open") != "open"):
@@ -1196,8 +1198,13 @@ def author_of(payload):
     try:
         if payload.get("object_kind") == "note":
             return ((payload.get("merge_request") or {}).get("author") or {}).get("username", "")
-        if "object_attributes" in payload:
-            return (payload["object_attributes"].get("author") or {}).get("username", "")
+        attrs = payload.get("object_attributes") or {}
+        if attrs:
+            # GitLab MR hooks usually ship only `author_id`; note hooks carry the object.
+            name = (attrs.get("author") or {}).get("username", "")
+            if name:
+                return name
+            return ((payload.get("merge_request") or {}).get("author") or {}).get("username", "")
         if "pull_request" in payload:
             return ((payload.get("pull_request") or {}).get("user") or {}).get("login", "")
         return ((payload.get("issue") or {}).get("user") or {}).get("login", "")

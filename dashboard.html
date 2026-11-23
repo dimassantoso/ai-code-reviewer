@@ -61,13 +61,13 @@
 
 <h2>In progress</h2>
 <table>
-  <thead><tr><th>Target</th><th>Platform</th><th>Stage</th><th>Elapsed</th><th style="width:24%">Progress</th></tr></thead>
-  <tbody id="live"><tr><td colspan="5" class="empty">idle</td></tr></tbody>
+  <thead><tr><th>Target</th><th>MR author</th><th>Platform</th><th>Stage</th><th>Elapsed</th><th style="width:24%">Progress</th></tr></thead>
+  <tbody id="live"><tr><td colspan="6" class="empty">idle</td></tr></tbody>
 </table>
 
 <h2>History</h2>
 <table>
-  <thead><tr><th>When</th><th>Target</th><th>Author</th><th>Verdict</th><th>Inline</th><th>Duration</th><th>Status</th><th>Remark</th></tr></thead>
+  <thead><tr><th>When</th><th>Target</th><th>MR author</th><th>Verdict</th><th>Inline</th><th>Duration</th><th>Status</th><th>Remark</th></tr></thead>
   <tbody id="hist"><tr><td colspan="8" class="empty">no reviews yet</td></tr></tbody>
 </table>
 
@@ -96,10 +96,10 @@ async function tick() {
     set("s-failed", s.failed, "bad");
 
     document.getElementById("live").innerHTML = d.live.length ? d.live.map(j => `<tr>
-      <td class="mono">${link(j.target, j.url)}</td><td>${esc(j.platform)}</td><td>${esc(j.stage)}</td>
+      <td class="mono">${link(j.target, j.url)}</td><td>${esc(j.author) || "–"}</td><td>${esc(j.platform)}</td><td>${esc(j.stage)}</td>
       <td class="num">${secs(j.elapsed)}</td>
       <td><div class="bar"><i style="width:${j.pct}%"></i></div></td></tr>`).join("")
-      : '<tr><td colspan="5" class="empty">idle</td></tr>';
+      : '<tr><td colspan="6" class="empty">idle</td></tr>';
 
     document.getElementById("hist").innerHTML = d.history.length ? d.history.slice(0, 50).map(h => `<tr>
       <td class="num">${when(h.started)}</td><td class="mono">${link(h.target, h.url)}</td>

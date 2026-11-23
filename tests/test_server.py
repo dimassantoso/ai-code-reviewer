@@ -1102,6 +1102,63 @@ class ResolveThreadTests(unittest.TestCase):
         api_json.assert_not_called()
 
 
+class AuthorColumnTests(unittest.TestCase):
+    """The dashboard's MR-author column must actually fill in."""
+
+    CONFIG = {"token": "gl", "secret": SECRET, "url": "https://gl.example"}
+
+    def setUp(self):
+        server._reviewed.clear()
+
+    def test_gitlab_mr_hook_author(self):
+        payload = {"object_kind": "merge_request",
+                   "object_attributes": {"author_id": 7, "author": {"username": "dimas"}}}
+        self.assertEqual(server.author_of(payload), "dimas")
+
+    def test_gitlab_mr_hook_without_author_object_falls_back(self):
+        payload = {"object_kind": "merge_request", "object_attributes": {"author_id": 7},
+                   "merge_request": {"author": {"username": "dimas"}}}
+        self.assertEqual(server.author_of(payload), "dimas")
+
+    def test_gitlab_mr_hook_with_only_author_id_is_blank(self):
+        self.assertEqual(server.author_of({"object_attributes": {"author_id": 7}}), "")
+
+    def test_note_hook_author_is_the_mr_author(self):
+        payload = {"object_kind": "note",
+                   "merge_request": {"author": {"username": "dimas"}},
+                   "user": {"username": "someone-else"}}
+        self.assertEqual(server.author_of(payload), "dimas")
+
+    def test_github_pr_author(self):
+        self.assertEqual(server.author_of({"pull_request": {"user": {"login": "dimas"}}}), "dimas")
+
+    def test_author_resolved_from_the_api_reaches_the_record(self):
+        """A payload with no author still gets one once the API tells us who opened it."""
+        payload = {"object_kind": "merge_request", "project": {"id": 1, "path_with_namespace": "g/p"},
+                   "object_attributes": {"iid": 2, "action": "open", "state": "opened",
+                                         "author_id": 7, "title": "feat: x"}}
+        self.assertEqual(server.author_of(payload), "")  # what GitLab actually sends
+        job = {"base": "b", "token": "t", "path": "/p", "pid": 1, "iid": 2, "author": "dimas",
+               "files": [{"new_path": "a.py", "diff": "@@ -0,0 +1 @@\n+x"}],
+               "header": "h", "level": 40, "draft": False, "refs": {},
+               "head": "sha1", "diff": "@@ -0,0 +1 @@\n+x"}
+        tracker = server.Tracker(path=None)
+        rec = tracker.begin("gitlab", "g/p!2", server.author_of(payload))
+
+        def track(stage, **fields):
+            rec.update(fields)
+
+        with patch.object(server, "collect_gitlab", return_value=job), \
+                patch.object(server, "run_hermes", return_value="ok\nVERDICT: APPROVE"), \
+                patch.object(server, "api"), patch.object(server, "reviewer_of", return_value="bot"), \
+                patch.object(server, "gl_post_inline", return_value=set()), \
+                patch.object(server, "gl_resolve_fixed", return_value=0), \
+                patch.object(server, "gl_approve"), patch.object(server, "superseded", return_value=False):
+            server.process("gitlab", "Merge Request Hook", payload, self.CONFIG, track)
+        tracker.finish(rec, "done")
+        self.assertEqual(tracker.snapshot()["history"][0]["author"], "dimas")
+
+
 class ReviewerFlagTests(unittest.TestCase):
     """Comments distinguish the MR author from the reviewing bot."""
 
