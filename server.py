@@ -167,6 +167,7 @@ class Tracker:
         self.seq = 0
         self.changed = threading.Condition()  # wakes dashboard streams on any change
         self.version = 0
+        self._authors = {}  # target -> MR author, learned once
         self._load()
 
     def _load(self):
@@ -186,14 +187,37 @@ class Tracker:
                                 rec["target"] = label_from_url(rec["url"]) or rec["target"]
                         if not rec.get("remark"):
                             rec["remark"] = remark_of(rec)
+                        if rec.get("author") and rec.get("target"):
+                            self._authors[rec["target"]] = rec["author"]
                         self.done.appendleft(rec)
                         self.seq = max(self.seq, int(rec["id"]))
+            # Note rows written before we learned to carry the author over stay blank
+            # in the store; fill them from the map so history stops looking broken.
+            for rec in self.done:
+                if not rec.get("author"):
+                    rec["author"] = self._authors.get(rec.get("target"), "")
         except OSError:
             LOG.warning("review store %s unreadable, starting empty", self.path)
+
+    def author_of_target(self, target):
+        """The MR author we already learned for this target, if any.
+
+        GitLab note hooks carry only `merge_request.author_id` — no username — so a
+        comment-triggered row would otherwise land blank. The author of a merge
+        request never changes, so an earlier record for the same target is the answer.
+        """
+        if not target:
+            return ""
+        with self.lock:
+            if target in self._authors:
+                return self._authors[target]
+        return ""
 
     def begin(self, platform, target, author="", files=0, url=""):
         with self.lock:
             self.seq += 1
+            if author and target:
+                self._authors[target] = author
             rec = {"id": self.seq, "platform": platform, "target": target, "author": author, "url": url,
                    "status": "running", "stage": "queued", "started": time.time(),
                    "duration": 0.0, "verdict": "", "inline": 0, "files": files, "error": "",
@@ -1131,7 +1155,9 @@ def worker():
 
 
 def run_job(platform, event, payload, cfg, raw, key):
-    rec = _tracker.begin(platform, label_of(platform, payload), author_of(payload),
+    target = label_of(platform, payload)
+    rec = _tracker.begin(platform, target,
+                         author_of(payload) or _tracker.author_of_target(target),
                          url=url_of(platform, payload))
     fields = {}
 

@@ -1267,6 +1267,56 @@ class AuthorColumnTests(unittest.TestCase):
         self.assertEqual(tracker.snapshot()["history"][0]["author"], "dimas")
 
 
+class AuthorCarryOverTests(unittest.TestCase):
+    """A note hook knows only `author_id`, so the row reuses what we learned earlier.
+
+    Reproduces pasarpolis/integrationservice!4895: the review row carried the author,
+    the own-comment row right after it did not.
+    """
+
+    TARGET = "pasarpolis/integrationservice!4895"
+
+    def setUp(self):
+        server._reviewed.clear()
+
+    def test_note_row_reuses_the_author_of_the_mr_row(self):
+        """Drives run_job, so it proves the carry-over is wired in — not just that it exists."""
+        tracker = server.Tracker(path=None)
+        tracker.begin("gitlab", self.TARGET, "alvian.r.hanif")  # the review row, earlier
+        payload = {"object_kind": "note",
+                   "project": {"id": 1, "path_with_namespace": "pasarpolis/integrationservice"},
+                   "merge_request": {"iid": 4895},
+                   "object_attributes": {"note": "x", "noteable_iid": 4895, "discussion_id": "d"}}
+        self.assertEqual(server.author_of(payload), "")  # what GitLab actually sends
+        with patch.object(server, "_tracker", tracker), \
+                patch.object(server, "debate", return_value=False):
+            server.run_job("gitlab", "Note Hook", payload, {"token": "t", "url": "https://gl.example"},
+                           b"{}", "k1")
+        skipped = tracker.snapshot()["history"][0]
+        self.assertEqual(skipped["target"], self.TARGET)
+        self.assertEqual(skipped["author"], "alvian.r.hanif")
+
+    def test_rows_loaded_from_the_store_get_their_author_backfilled(self):
+        """History written before the carry-over existed still renders an author."""
+        path = os.path.join(tempfile.mkdtemp(), "reviews.jsonl")
+        base = {"platform": "gitlab", "target": self.TARGET, "url": "https://gitlab.com/g/p/-/merge_requests/4895"}
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(dict(base, id=1, author="alvian.r.hanif", status="done",
+                                     stage="done", started=1.0, duration=247.9,
+                                     verdict="", inline=0, files=0, error="", remark="")) + "\n")
+            fh.write(json.dumps(dict(base, id=2, author="", status="skipped",
+                                     stage="skipped", started=2.0, duration=0.0,
+                                     verdict="", inline=0, files=0, error="",
+                                     remark="comment is one of our own replies")) + "\n")
+        history = server.Tracker(path=path).snapshot()["history"]
+        self.assertEqual([r["author"] for r in history], ["alvian.r.hanif", "alvian.r.hanif"])
+
+    def test_unknown_target_stays_blank_instead_of_inventing_one(self):
+        tracker = server.Tracker(path=None)
+        self.assertEqual(tracker.author_of_target("nobody/here!1"), "")
+        self.assertEqual(tracker.author_of_target(""), "")
+
+
 class ReviewerFlagTests(unittest.TestCase):
     """Comments distinguish the MR author from the reviewing bot."""
 
