@@ -5,112 +5,217 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AI Code Reviewer</title>
 <style>
-  :root { --bg:#0e1117; --panel:#161b22; --line:#232a34; --fg:#e6edf3; --dim:#8b949e;
-          --ok:#3fb950; --warn:#d29922; --bad:#f85149; --accent:#58a6ff; }
+  /* Monitor surface: density and glanceability, no marketing framing.
+     One accent (amber) means "in flight"; green/red are reserved for outcomes. */
+  :root {
+    --bg:#0b0d10; --panel:#11141a; --panel-2:#151922; --line:#1f242e;
+    --fg:#e7eaf0; --dim:#8a93a1; --faint:#737c8b;
+    --live:#e0a75e; --ok:#5cb870; --bad:#e0574f;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
   * { box-sizing:border-box; }
-  body { margin:0; padding:20px; background:var(--bg); color:var(--fg);
-         font:14px/1.5 ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif; }
-  h1 { font-size:18px; margin:0 0 2px; font-weight:600; }
-  .sub { color:var(--dim); font-size:12px; margin-bottom:18px; }
-  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; margin-bottom:20px; }
-  .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px 14px; }
-  .card .k { color:var(--dim); font-size:11px; text-transform:uppercase; letter-spacing:.04em; }
-  .card .v { font-size:22px; font-weight:600; margin-top:4px; font-variant-numeric:tabular-nums; }
-  .v.ok { color:var(--ok); } .v.bad { color:var(--bad); } .v.blue { color:var(--accent); }
-  h2 { font-size:13px; text-transform:uppercase; letter-spacing:.05em; color:var(--dim);
-       margin:22px 0 8px; font-weight:600; }
-  table { width:100%; border-collapse:collapse; background:var(--panel);
-          border:1px solid var(--line); border-radius:8px; overflow:hidden; }
-  th, td { text-align:left; padding:8px 12px; border-bottom:1px solid var(--line); font-size:13px; }
-  th { color:var(--dim); font-weight:500; font-size:11px; text-transform:uppercase; letter-spacing:.04em; }
-  tr:last-child td { border-bottom:none; }
-  .pager { float:right; font-size:12px; font-weight:400; text-transform:none; letter-spacing:0; color:var(--dim); }
-  .pager button { font:inherit; margin:0 6px; padding:2px 8px; cursor:pointer;
-    background:transparent; color:var(--dim); border:1px solid var(--line); border-radius:5px; }
-  .pager button:hover:not(:disabled) { color:var(--fg); border-color:var(--dim); }
-  .pager button:disabled { opacity:.35; cursor:default; }
-  td.num { font-variant-numeric:tabular-nums; }
-  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
-  a { color:var(--accent); text-decoration:none; }
-  a:hover { text-decoration:underline; }
-  .pill { display:inline-block; padding:1px 7px; border-radius:10px; font-size:11px; font-weight:600; }
-  .pill.done { background:rgba(63,185,80,.15); color:var(--ok); }
-  .pill.failed { background:rgba(248,81,73,.15); color:var(--bad); }
-  .pill.skipped { background:rgba(139,148,158,.15); color:var(--dim); }
-  .pill.running { background:rgba(88,166,255,.15); color:var(--accent); }
-  .pill.APPROVE { background:rgba(63,185,80,.15); color:var(--ok); }
-  .pill.REQUEST_CHANGES { background:rgba(248,81,73,.15); color:var(--bad); }
-  .bar { height:6px; background:var(--line); border-radius:3px; overflow:hidden; min-width:90px; }
-  .bar > i { display:block; height:100%; background:var(--accent); transition:width .4s ease; }
-  .bar.done > i { background:var(--ok); }
-  .empty { color:var(--dim); padding:14px; text-align:center; font-size:13px; }
-  .err { color:var(--bad); font-size:12px; }
-  td.remark { color:var(--dim); font-size:12px; max-width:320px; }
-  #stamp { float:right; color:var(--dim); font-size:11px; }
+  body { margin:0; padding:22px 26px 40px; background:var(--bg); color:var(--fg);
+         font:13px/1.5 -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+         font-variant-numeric: tabular-nums; }
+  .wrap { max-width:1180px; margin:0 auto; }
+
+  header { display:flex; align-items:baseline; justify-content:space-between;
+           gap:16px; flex-wrap:wrap; padding-bottom:14px; border-bottom:1px solid var(--line); }
+  h1 { font:600 13px/1.4 var(--mono); letter-spacing:.14em; text-transform:uppercase;
+       margin:0; color:var(--fg); }
+  .conn { display:flex; align-items:center; gap:7px; color:var(--dim); font-size:11.5px; }
+  .dot { width:6px; height:6px; border-radius:50%; background:var(--live); flex:none; }
+  .conn.stale .dot { background:var(--faint); }
+  #stamp { color:var(--faint); font-size:11px; }
+
+  h2 { font:600 10px/1 var(--mono); letter-spacing:.1em; text-transform:uppercase;
+       color:var(--dim); margin:0; }
+
+  /* Metrics rail: one panel, hierarchy by weight and size, not eight equal boxes. */
+  .strip { display:flex; flex-wrap:wrap; align-items:stretch; gap:0;
+           background:var(--panel); border:1px solid var(--line); border-radius:6px;
+           margin:16px 0 0; overflow:hidden; }
+  .lead { padding:12px 16px; border-right:1px solid var(--line); min-width:132px; }
+  .lead .k { display:block; color:var(--dim); font:600 10px/1 var(--mono);
+             letter-spacing:.1em; text-transform:uppercase; }
+  .lead .v { display:block; font-size:26px; font-weight:600; letter-spacing:-.02em; line-height:1.15; margin-top:5px; }
+  .lead .note { color:var(--faint); font-size:11px; }
+  .rail { display:grid; grid-template-columns:repeat(auto-fit,minmax(88px,1fr));
+          flex:1; min-width:0; }
+  .rail > div { padding:12px 14px; border-right:1px solid var(--line); }
+  .rail > div:last-child { border-right:0; }
+  .rail .k { display:block; color:var(--dim); font:600 10px/1 var(--mono);
+             letter-spacing:.1em; text-transform:uppercase; white-space:nowrap; }
+  .rail .v { display:block; font-size:15px; font-weight:600; margin-top:5px; }
+  .v.ok { color:var(--ok); } .v.bad { color:var(--bad); } .v.live-v { color:var(--live); }
+
+
+  section { margin-top:26px; }
+  .sechead { display:flex; align-items:baseline; justify-content:space-between;
+             gap:12px; margin-bottom:8px; }
+  .note { color:var(--faint); font-size:11px; }
+
+  .tbl { border:1px solid var(--line); border-radius:6px; background:var(--panel); overflow:auto; }
+  table { width:100%; border-collapse:separate; border-spacing:0; font-size:12.5px; }
+  thead th { position:sticky; top:0; z-index:1; background:var(--panel-2);
+             color:#9aa3af; font:600 10.5px/1 var(--mono); letter-spacing:.09em;
+             text-transform:uppercase; text-align:left; padding:8px 12px;
+             border-bottom:1px solid var(--line); white-space:nowrap; }
+  tbody td { padding:7px 12px; border-bottom:1px solid var(--line); vertical-align:middle; }
+  tbody tr:last-child td { border-bottom:0; }
+  tbody tr:hover { background:rgba(255,255,255,.018); }
+  td.nowrap, th.nowrap { white-space:nowrap; }
+  td.num { text-align:right; }
+  th.num { text-align:right; }
+  .empty { color:var(--faint); padding:16px 12px !important; font-size:12px; }
+
+  .mono { font-family:var(--mono); font-size:12px; }
+  a { color:var(--fg); text-decoration:none; border-bottom:1px solid var(--line); }
+  a:hover { border-bottom-color:var(--dim); }
+  .dim { color:var(--dim); }
+
+  .pill { display:inline-block; padding:1px 6px; border-radius:3px; font:600 10px/1.6 var(--mono);
+          letter-spacing:.06em; text-transform:uppercase; white-space:nowrap; }
+  .pill.done { color:var(--ok); background:rgba(92,184,112,.12); }
+  .pill.failed { color:var(--bad); background:rgba(224,87,79,.12); }
+  .pill.skipped { color:var(--dim); background:rgba(138,147,161,.1); }
+  .pill.running { color:var(--live); background:rgba(224,167,94,.12); }
+  .pill.APPROVE { color:var(--ok); background:rgba(92,184,112,.12); }
+  .pill.REQUEST_CHANGES { color:var(--bad); background:rgba(224,87,79,.12); }
+  .stage { display:inline-flex; align-items:center; gap:6px; color:var(--dim); font-size:12px; }
+  .stage i { width:5px; height:5px; border-radius:50%; background:var(--live); }
+  @media (prefers-reduced-motion: no-preference) {
+    .stage i { animation:pulse 1.6s ease-in-out infinite; }
+    @keyframes pulse { 50% { opacity:.25; } }
+  }
+  .bar { height:3px; background:var(--line); border-radius:2px; overflow:hidden; min-width:80px; }
+  .bar > i { display:block; height:100%; background:var(--live); transition:width .4s ease; }
+
+  .remark { color:var(--dim); font-size:11.5px; max-width:340px; overflow:hidden;
+            text-overflow:ellipsis; white-space:nowrap; }
+  .remark.bad { color:var(--bad); }
+
+  .foot { display:flex; align-items:center; justify-content:flex-end; gap:10px;
+          margin-top:8px; color:var(--dim); font-size:11px; }
+  .foot button { font:inherit; padding:3px 9px; cursor:pointer; color:var(--dim);
+                 background:transparent; border:1px solid var(--line); border-radius:4px; }
+  .foot button:hover:not(:disabled) { color:var(--fg); border-color:var(--dim); }
+  .foot button:disabled { opacity:.3; cursor:default; }
+  button:focus-visible, a:focus-visible { outline:1px solid var(--live); outline-offset:2px; }
+
+  @media (max-width:640px) {
+    body { padding:16px 14px 32px; }
+    .lead { border-right:0; border-bottom:1px solid var(--line); flex:1 0 100%; }
+  }
 </style>
 </head>
 <body>
-<h1>AI Code Reviewer <span id="stamp"></span></h1>
-<div class="sub" id="conn">connecting…</div>
+<div class="wrap">
+  <header>
+    <h1>AI Code Reviewer</h1>
+    <div class="conn" id="conn" aria-live="polite">
+      <span class="dot"></span><span id="conn-text">connecting…</span>
+      <span id="stamp"></span>
+    </div>
+  </header>
 
-<div class="cards">
-  <div class="card"><div class="k">Reviews</div><div class="v" id="s-total">–</div></div>
-  <div class="card"><div class="k">Today</div><div class="v" id="s-today">–</div></div>
-  <div class="card"><div class="k">Running</div><div class="v blue" id="s-running">–</div></div>
-  <div class="card"><div class="k">Queued</div><div class="v" id="s-queued">–</div></div>
-  <div class="card"><div class="k">Avg time</div><div class="v" id="s-avg">–</div></div>
-  <div class="card"><div class="k">p95</div><div class="v" id="s-p95">–</div></div>
-  <div class="card"><div class="k">Approved</div><div class="v ok" id="s-approve">–</div></div>
-  <div class="card"><div class="k">Failed</div><div class="v bad" id="s-failed">–</div></div>
+  <div class="strip">
+    <div class="lead">
+      <span class="k">Today</span>
+      <span class="v" id="s-today">–</span>
+      <span class="note">of <b id="s-total">–</b> all time</span>
+    </div>
+    <div class="rail">
+      <div><span class="k">Running</span><span class="v live-v" id="s-running">–</span></div>
+      <div><span class="k">Queued</span><span class="v" id="s-queued">–</span></div>
+      <div><span class="k">Approved</span><span class="v ok" id="s-approve">–</span></div>
+      <div><span class="k">Failed</span><span class="v bad" id="s-failed">–</span></div>
+      <div><span class="k">Avg</span><span class="v" id="s-avg">–</span></div>
+      <div><span class="k">p95</span><span class="v" id="s-p95">–</span></div>
+    </div>
+  </div>
+
+  <section>
+    <div class="sechead"><h2>Now</h2><span class="note" id="live-note"></span></div>
+    <div class="tbl">
+      <table>
+        <thead><tr>
+          <th scope="col">Target</th><th scope="col">MR author</th><th scope="col">Platform</th>
+          <th scope="col">Stage</th><th scope="col" class="num">Elapsed</th>
+          <th scope="col" style="width:22%">Progress</th>
+        </tr></thead>
+        <tbody id="live"><tr><td colspan="6" class="empty">idle — waiting for a webhook</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <div class="sechead"><h2>History</h2><span class="note" id="hist-note"></span></div>
+    <div class="tbl">
+      <table>
+        <thead><tr>
+          <th scope="col" class="nowrap">When</th><th scope="col">Target</th><th scope="col">MR author</th>
+          <th scope="col">Verdict</th><th scope="col" class="num">Inline</th>
+          <th scope="col" class="num">Duration</th><th scope="col">Status</th><th scope="col">Remark</th>
+        </tr></thead>
+        <tbody id="hist"><tr><td colspan="8" class="empty">no reviews yet</td></tr></tbody>
+      </table>
+    </div>
+    <div class="foot" id="pager"></div>
+  </section>
 </div>
-
-<h2>In progress</h2>
-<table>
-  <thead><tr><th>Target</th><th>MR author</th><th>Platform</th><th>Stage</th><th>Elapsed</th><th style="width:24%">Progress</th></tr></thead>
-  <tbody id="live"><tr><td colspan="6" class="empty">idle</td></tr></tbody>
-</table>
-
-<h2>History <span class="pager" id="pager"></span></h2>
-<table>
-  <thead><tr><th>When</th><th>Target</th><th>MR author</th><th>Verdict</th><th>Inline</th><th>Duration</th><th>Status</th><th>Remark</th></tr></thead>
-  <tbody id="hist"><tr><td colspan="8" class="empty">no reviews yet</td></tr></tbody>
-</table>
 
 <script>
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const secs = n => n >= 60 ? Math.floor(n / 60) + "m " + Math.round(n % 60) + "s" : (n || 0).toFixed(1) + "s";
-// Show the MR/PR URL itself: a short label like "group/project!12" is not
-// clickable once the record lost its url, and "?" tells nobody anything.
-const link = (label, url) => url && /^https:\/\//.test(url)
-  ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer" title="${esc(label)}">${esc(url.replace(/^https:\/\//, ""))}</a>`
-  : esc(label && label !== "?" ? label : "—");
+// Show the short target ("group/project!12") and keep the full URL in the href
+// and the tooltip: repeating the host and the /merge_requests/ path on every row
+// costs the widest column in the table and tells nobody anything.
+const link = (label, url) => {
+  const name = label && label !== "?" ? label : (url || "").replace(/^https:\/\/[^/]+\//, "");
+  return url && /^https:\/\//.test(url)
+    ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer" title="${esc(url)}">${esc(name || url)}</a>`
+    : esc(name || "—");
+};
 // History is paged in the browser: the snapshot already carries every record
 // (up to the store's limit), so paging costs no extra request.
 const PAGE = 25;
 let page = 0;
 let rows = [];
 let last = null;  // latest snapshot, so paging redraws without waiting for the next push
-const when = t => new Date(t * 1000).toLocaleString(undefined, {month:"short", day:"numeric", hour:"2-digit", minute:"2-digit"});
+const when = t => new Date(t * 1000).toLocaleString(undefined,
+  {month:"short", day:"numeric", hour:"2-digit", minute:"2-digit"});
 
 function render(d) {
     last = d;
     const s = d.stats;
-    document.getElementById("conn").textContent =
-      s.workers + " workers · " + s.inline + " inline comments posted · live";
+    document.getElementById("conn-text").textContent =
+      s.workers + " workers · " + s.inline + " inline comments · live";
+    document.getElementById("conn").classList.remove("stale");
     document.getElementById("stamp").textContent = new Date().toLocaleTimeString();
-    const set = (id, v, cls) => { const e = document.getElementById(id); e.textContent = v; if (cls) e.className = "v " + cls; };
-    set("s-total", s.total); set("s-today", s.today); set("s-running", s.running, "blue");
+    const set = (id, v, cls) => {
+      const e = document.getElementById(id);
+      e.textContent = v;
+      if (cls) e.className = "v " + cls;
+    };
+    set("s-total", s.total); set("s-today", s.today); set("s-running", s.running, "live-v");
     set("s-queued", s.queued); set("s-avg", s.avg ? secs(s.avg) : "–");
     set("s-p95", s.p95 ? secs(s.p95) : "–"); set("s-approve", s.verdicts.APPROVE || 0, "ok");
     set("s-failed", s.failed, "bad");
 
+    document.getElementById("live-note").textContent = d.live.length
+      ? d.live.length + " in flight" : "";
     document.getElementById("live").innerHTML = d.live.length ? d.live.map(j => `<tr>
-      <td class="mono">${link(j.target, j.url)}</td><td>${esc(j.author) || "–"}</td><td>${esc(j.platform)}</td><td>${esc(j.stage)}</td>
+      <td class="mono">${link(j.target, j.url)}</td><td class="dim">${esc(j.author) || "–"}</td>
+      <td class="dim">${esc(j.platform)}</td>
+      <td><span class="stage"><i></i>${esc(j.stage)}</span></td>
       <td class="num">${secs(j.elapsed)}</td>
       <td><div class="bar"><i style="width:${j.pct}%"></i></div></td></tr>`).join("")
-      : '<tr><td colspan="6" class="empty">idle</td></tr>';
+      : '<tr><td colspan="6" class="empty">idle — waiting for a webhook</td></tr>';
 
     rows = d.history;
+    document.getElementById("hist-note").textContent = rows.length
+      ? rows.length + " recorded" : "";
     const pages = Math.max(1, Math.ceil(rows.length / PAGE));
     if (page >= pages) page = pages - 1;
     const from = page * PAGE, slice = rows.slice(from, from + PAGE);
@@ -118,14 +223,17 @@ function render(d) {
       ? `<button ${page ? "" : "disabled"} data-p="-1">‹ prev</button>
          <span>${from + 1}–${from + slice.length} of ${rows.length}</span>
          <button ${page < pages - 1 ? "" : "disabled"} data-p="1">next ›</button>`
-      : `<span>${rows.length} review${rows.length === 1 ? "" : "s"}</span>`;
-    document.getElementById("hist").innerHTML = slice.length ? slice.map(h => `<tr>
-      <td class="num">${when(h.started)}</td><td class="mono">${link(h.target, h.url)}</td>
-      <td>${esc(h.author) || "–"}</td>
+      : "";
+    document.getElementById("hist").innerHTML = slice.length ? slice.map(h => {
+      const why = h.error || h.remark || "";
+      return `<tr>
+      <td class="num nowrap dim">${when(h.started)}</td><td class="mono">${link(h.target, h.url)}</td>
+      <td class="dim">${esc(h.author) || "–"}</td>
       <td>${h.verdict ? `<span class="pill ${esc(h.verdict)}">${esc(h.verdict)}</span>` : "–"}</td>
-      <td class="num">${h.inline || 0}</td><td class="num">${secs(h.duration)}</td>
+      <td class="num">${h.inline || 0}</td><td class="num dim">${secs(h.duration)}</td>
       <td><span class="pill ${esc(h.status)}">${esc(h.status)}</span></td>
-      <td class="remark">${esc(h.error || h.remark || "—")}</td></tr>`).join("")
+      <td class="remark ${h.error ? "bad" : ""}" title="${esc(why)}">${esc(why)}</td></tr>`;
+    }).join("")
       : '<tr><td colspan="8" class="empty">no reviews yet</td></tr>';
 }
 
@@ -145,7 +253,8 @@ function connect() {
   es = new EventSource("/api/events");
   es.onmessage = e => { try { render(JSON.parse(e.data)); } catch (_) {} };
   es.onerror = () => {
-    document.getElementById("conn").textContent = "reconnecting…";
+    document.getElementById("conn-text").textContent = "reconnecting…";
+    document.getElementById("conn").classList.add("stale");
   };
 }
 connect();
