@@ -132,8 +132,12 @@ def run_hermes(diff, timeout=None):
         cmd += ["-s", os.environ["HERMES_SKILL"]]
     env = {k: v for k, v in os.environ.items() if not k.startswith("HERMES_SESSION_") and k not in ("HERMES_AGENT", "HERMES_SUPERVISED_CHILD", "GITLAB_TOKEN", "GITHUB_TOKEN", "WEBHOOK_SECRET", "GITLAB_WEBHOOK_SECRET", "GITHUB_WEBHOOK_SECRET")}
     timeout = timeout or int(os.getenv("HERMES_TIMEOUT_S", "300"))
-    result = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
-                            timeout=timeout, env=env, check=True)
+    try:
+        result = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
+                                timeout=timeout, env=env, check=True)
+    except subprocess.TimeoutExpired:
+        # str(TimeoutExpired) is the whole argv, which then lands on the dashboard.
+        raise ValueError("review timed out after %ss" % timeout) from None
     output = re.sub(r"(?m)^session_id:.*$\n?", "", result.stdout).strip()
     if not output:
         raise ValueError("Hermes returned empty output")
@@ -153,6 +157,12 @@ def positive(value):
 def bot_mentioned(text):
     """Whole-username match so @santosodbot does not trigger @santosodb."""
     return bool(BOT_USERNAME and re.search(rf"(?<![\w-])@{re.escape(BOT_USERNAME)}(?![\w-])", text, re.I))
+
+
+def _short(text, limit=200):
+    """One line, capped: error strings are rendered in a table cell."""
+    flat = re.sub(r"\s+", " ", str(text)).strip()
+    return flat if len(flat) <= limit else flat[:limit - 1] + "\u2026"
 
 
 class Tracker:
@@ -244,6 +254,9 @@ class Tracker:
         """Move a job out of the live map into history, and persist it."""
         if rec is None:
             return
+        if isinstance(fields.get("error"), str):
+            # A dashboard cell, not a log line: keep the reason, drop the argv dumps.
+            fields["error"] = _short(fields["error"])
         with self.lock:
             rec.update(fields)
             rec["status"] = status
@@ -840,35 +853,38 @@ DEBATE_RULES = (
 )
 
 
-def debate(platform, payload, config, track=None):
-    """Answer a comment in its own thread. Returns True if a reply was posted.
+class CommentDecision(collections.namedtuple("CommentDecision", "reply reason ctx")):
+    """Does this comment owe a reply? `reason` says why not; `ctx` is what to reply with."""
 
-    A comment must name the bot — or be a reply inside a thread the bot opened,
-    where the thread itself is the address.
+    __slots__ = ()
+
+
+def comment_decision(platform, payload, config):
+    """Decide whether one comment event should get a reply, and gather what it needs.
+
+    Every rule that can say no lives here, in the order it should be asked, so the
+    answer is one testable function instead of gates scattered through `debate`.
     """
-    def skip(reason):
-        """Not answered, and the dashboard says why."""
-        if track:
-            track("skipped", remark=reason)
-        return False
-
+    no = lambda why: CommentDecision(False, why, {})
     if not BOT_USERNAME:
-        return skip("BOT_USERNAME is not set, so @mentions are not answered")
+        return no("BOT_USERNAME is not set, so mentions are not answered")
     base, token = config["url"] + "/api/v4", config["token"]
     if platform == "gitlab":
         attrs = payload.get("object_attributes") or {}
         noteable = attrs.get("noteable_type")
         if payload.get("object_kind") != "note" or noteable != "MergeRequest":
-            return skip("note is not on a merge request (noteable_type %r)" % noteable)
+            return no("note is not on a merge request (noteable_type %r)" % noteable)
         text = attrs.get("note") or ""
         pid = payload.get("project_id") or (payload.get("project") or {}).get("id")
-        iid, discussion_id, note_id = attrs.get("noteable_iid"), attrs.get("discussion_id", ""), attrs.get("id")
+        iid, discussion_id = attrs.get("noteable_iid"), attrs.get("discussion_id", "")
+        note_id = attrs.get("id")
         commenter = (payload.get("user") or {}).get("username", "")
         path = f"/projects/{pid}/merge_requests/{iid}"
         reply_path = (path + f"/discussions/{discussion_id}/notes") if discussion_id else path + "/notes"
+        repo = number = ""
     else:
         if payload.get("action") != "created":
-            return skip("comment action %r is not a new comment" % payload.get("action"))
+            return no("comment action %r is not a new comment" % payload.get("action"))
         comment = payload.get("comment") or {}
         text = comment.get("body") or ""
         issue = payload.get("issue") or payload.get("pull_request") or {}
@@ -876,22 +892,49 @@ def debate(platform, payload, config, track=None):
         number, note_id = (payload.get("pull_request") or issue).get("number"), comment.get("id")
         commenter = (comment.get("user") or {}).get("login", "")
         if not is_repo_name(repo) or not positive(number):
-            return skip("cannot resolve the repository or pull request number")
+            return no("cannot resolve the repository or pull request number")
         path = f"/repos/{repo}/issues/{number}"
         reply_path = path + "/comments"
-        discussion_id = ""
+        discussion_id = pid = iid = ""
     if REVIEW_MARKER in text:
-        return skip("comment is one of our own replies")
+        return no("comment is one of our own replies")
+    if not commenter:
+        return no("comment has no author")
+    if commenter == BOT_USERNAME or commenter.endswith("[bot]"):
+        return no("comment was written by a bot")
+    if platform == "gitlab" and (not positive(pid) or not positive(iid)):
+        return no("cannot resolve the project or merge request id")
     # Answering inside a thread we opened needs no @mention: replying there already
     # points at us. Only a bare comment on the MR has to name the bot.
     if not bot_mentioned(text) and not ours_thread(platform, base, token, pid, iid, discussion_id):
-        return skip("comment does not mention @%s" % BOT_USERNAME)
-    if not commenter:
-        return skip("comment has no author")
-    if commenter == BOT_USERNAME or commenter.endswith("[bot]"):
-        return skip("comment was written by a bot")
-    if platform == "gitlab" and (not positive(pid) or not positive(iid)):
-        return skip("cannot resolve the project or merge request id")
+        return no("comment does not mention @%s" % BOT_USERNAME)
+    return CommentDecision(True, "", {
+        "base": base, "token": token, "text": text, "pid": pid, "iid": iid,
+        "discussion_id": discussion_id, "note_id": note_id, "commenter": commenter,
+        "path": path, "reply_path": reply_path, "repo": repo, "number": number})
+
+
+def debate(platform, payload, config, track=None, verdict=None):
+    """Answer a comment in its own thread. Returns True if a reply was posted.
+
+    A comment must name the bot — or be a reply inside a thread the bot opened,
+    where the thread itself is the address. `verdict` is a `comment_decision` the
+    caller already made, so a gated comment is not judged (and fetched) twice.
+    """
+    def skip(reason):
+        """Not answered, and the dashboard says why."""
+        if track:
+            track("skipped", remark=reason)
+        return False
+
+    verdict = verdict or comment_decision(platform, payload, config)
+    if not verdict.reply:
+        return skip(verdict.reason)
+    ctx = verdict.ctx
+    base, token = ctx["base"], ctx["token"]
+    text, pid, iid, discussion_id = ctx["text"], ctx["pid"], ctx["iid"], ctx["discussion_id"]
+    note_id, commenter, path, reply_path = ctx["note_id"], ctx["commenter"], ctx["path"], ctx["reply_path"]
+    repo, number = ctx["repo"], ctx["number"]
     key = (discussion_id, note_id)
     with _replied_lock:
         if key in _replied:
@@ -1068,9 +1111,10 @@ def process(platform, event, payload, config, track=None):
         attrs = payload.get("object_attributes")
         if event != "Merge Request Hook" or payload.get("object_kind") != "merge_request":
             return skip("not a merge request event (%s)" % (event or "no event header"))
-        if not isinstance(attrs, dict) or attrs.get("action") not in REVIEW_ACTIONS:
-            action = attrs.get("action") if isinstance(attrs, dict) else "?"
-            return skip("MR action %r does not trigger a review" % action)
+        action = attrs.get("action") if isinstance(attrs, dict) else "?"
+        if not isinstance(attrs, dict) or not (action in REVIEW_ACTIONS
+                                               or (action == "update" and became_ready(payload))):
+            return skip("MR action %r does not trigger a review; only a new MR does" % action)
         state = (attrs.get("state") or "").lower()
         if state and state != "opened":
             return skip("MR is %s; only open merge requests are reviewed" % state)
@@ -1187,6 +1231,14 @@ def worker():
 
 
 def run_job(platform, event, payload, cfg, raw, key):
+    # Decide before opening a row: a comment that owes no reply is not an event we
+    # record. The gate runs the cheap checks first, so this costs nothing for noise.
+    verdict = None
+    if is_note_event(platform, payload):
+        verdict = comment_decision(platform, payload, cfg)
+        if not verdict.reply:
+            LOG.info("%s comment ignored: %s", platform, verdict.reason)
+            return
     target = label_of(platform, payload)
     rec = _tracker.begin(platform, target,
                          author_of(payload) or _tracker.author_of_target(target),
@@ -1200,7 +1252,7 @@ def run_job(platform, event, payload, cfg, raw, key):
     try:
         with target_lock(key):
             if is_note_event(platform, payload):
-                posted = debate(platform, payload, cfg, track)
+                posted = debate(platform, payload, cfg, track, verdict)
             else:
                 posted = process(platform, event, payload, cfg, track)
             LOG.info("%s review: %s", platform, "posted" if posted else "ignored")
@@ -1283,8 +1335,29 @@ def author_of(payload):
         return ""
 
 
-REVIEW_ACTIONS = {"open", "update", "reopen"}
-PR_ACTIONS = {"opened", "synchronize", "reopened", "ready_for_review"}
+# New work only: a review runs when the MR/PR is created. Every other `update`
+# fires on any push, label, or title edit, which buried real reviews in re-reviews
+# of a head the memory then skipped anyway. The one exception is a draft becoming
+# ready — otherwise a draft MR opened and then un-drafted would never be reviewed.
+REVIEW_ACTIONS = {"open"}
+PR_ACTIONS = {"opened", "ready_for_review"}
+
+
+def became_ready(payload):
+    """True when an `update` hook is the draft -> ready transition, not an edit."""
+    attrs = payload.get("object_attributes") or {}
+    change = (attrs.get("changes") or {}).get("draft")
+    if change is None:  # older GitLab sends [previous, current]; newer sends previous/current
+        change = (attrs.get("changes") or {}).get("title")
+    if isinstance(change, dict):
+        before, after = change.get("previous"), change.get("current")
+    elif isinstance(change, list) and len(change) == 2:
+        before, after = change
+    else:
+        return False
+    was = bool(before) if isinstance(before, bool) else bool(re.match(r"(?i)^\s*(draft|wip)\b", str(before or "")))
+    now = bool(after) if isinstance(after, bool) else bool(re.match(r"(?i)^\s*(draft|wip)\b", str(after or "")))
+    return was and not now
 
 
 def triggers_review(platform, event, payload):
@@ -1304,7 +1377,9 @@ def triggers_review(platform, event, payload):
         if platform == "gitlab":
             attrs = payload.get("object_attributes")
             if (event != "Merge Request Hook" or payload.get("object_kind") != "merge_request"
-                    or not isinstance(attrs, dict) or attrs.get("action") not in REVIEW_ACTIONS):
+                    or not isinstance(attrs, dict)
+                    or not (attrs.get("action") in REVIEW_ACTIONS
+                            or (attrs.get("action") == "update" and became_ready(payload)))):
                 return False
             state = (attrs.get("state") or "").lower()
             return not state or state == "opened"  # closed/merged are ignored, not recorded
