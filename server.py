@@ -750,6 +750,32 @@ def gl_approve(base, token, path, author):
     return bool(result.get("approved") or "id" in result)
 
 
+def ours_thread(platform, base, token, pid, iid, discussion_id):
+    """True when this discussion was started by us, so a reply needs no @mention.
+
+    GitLab only: a GitHub issue comment carries no thread identity, and replying on
+    a PR without naming the bot is just conversation. Best-effort — any API problem
+    means "not ours", which falls back to requiring the mention.
+    """
+    if platform != "gitlab" or not discussion_id or not positive(pid) or not positive(iid):
+        return False
+    try:
+        discussions = api_json(base, token, "gitlab",
+                               f"/projects/{pid}/merge_requests/{iid}/discussions?per_page=100")
+    except (HTTPError, URLError, ValueError, OSError, TypeError):
+        return False  # a failed lookup must not cost the whole reply
+    if not isinstance(discussions, list):
+        return False
+    discussion = next((d for d in discussions if str(d.get("id")) == str(discussion_id)), None)
+    if not discussion:
+        return False
+    notes = [n for n in (discussion.get("notes") or []) if not n.get("system")]
+    if not notes:
+        return False
+    opener = (notes[0].get("author") or {}).get("username", "")
+    return bool(BOT_USERNAME) and opener == BOT_USERNAME
+
+
 def gl_thread(base, token, pid, iid, discussion_id):
     """Bounded transcript of one discussion, including the bot's earlier claim."""
     discussions = api_json(base, token, "gitlab", f"/projects/{pid}/merge_requests/{iid}/discussions?per_page=100")
@@ -815,7 +841,11 @@ DEBATE_RULES = (
 
 
 def debate(platform, payload, config, track=None):
-    """Reply to an @mention inside its own thread. Returns True if a reply was posted."""
+    """Answer a comment in its own thread. Returns True if a reply was posted.
+
+    A comment must name the bot — or be a reply inside a thread the bot opened,
+    where the thread itself is the address.
+    """
     def skip(reason):
         """Not answered, and the dashboard says why."""
         if track:
@@ -852,7 +882,9 @@ def debate(platform, payload, config, track=None):
         discussion_id = ""
     if REVIEW_MARKER in text:
         return skip("comment is one of our own replies")
-    if not bot_mentioned(text):
+    # Answering inside a thread we opened needs no @mention: replying there already
+    # points at us. Only a bare comment on the MR has to name the bot.
+    if not bot_mentioned(text) and not ours_thread(platform, base, token, pid, iid, discussion_id):
         return skip("comment does not mention @%s" % BOT_USERNAME)
     if not commenter:
         return skip("comment has no author")

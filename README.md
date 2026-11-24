@@ -47,7 +47,7 @@ Copy `.env.example` to `.env` and fill in at least one platform token and its we
 | `HERMES_TIMEOUT_S` | CLI timeout in seconds; default `300`. |
 | `MAX_WORKERS` | Concurrent reviews; each one runs a `hermes` subprocess. Default `4`. |
 | `QUEUE_SIZE` | Pending reviews held before new webhooks get `503`. Default `100`. |
-| `BOT_USERNAME` | GitLab username to answer `@mention` debates. Blank disables debate replies. |
+| `BOT_USERNAME` | GitLab username to answer mentions. Blank disables debate replies entirely. |
 | `MIN_ACCESS_LEVEL` | GitLab access level required to review/reply. Default `30` (Developer). |
 | `APPROVE_ACCESS_LEVEL` | Access level required for auto-approve. Default `40` (Maintainer). |
 | `COOLDOWN_SECONDS` | Per-user per-thread debate cooldown. Default `30`. |
@@ -140,7 +140,7 @@ the store, then restarts.
 - Auto-approve: verdict `APPROVE` and the token user may approve. GitLab additionally requires access ≥ `APPROVE_ACCESS_LEVEL` and checks `user_can_approve`; GitHub requires push permission on the repo.
 - A review whose head commit moved while the model was thinking is discarded, so a stale verdict never lands on newer code.
 - A target whose head SHA was already reviewed is skipped. This is what stops the approve -> update event -> approve loop: our own approval fires a fresh MR event with identical code. Push a new commit and the head changes, so it is reviewed again. The memory is in-process (cleared on restart).
-- Debate: a GitLab note or GitHub comment that `@BOT_USERNAME` and is not our own reply gets an in-thread answer. Per-note dedupe, per-thread cooldown (`COOLDOWN_SECONDS`), a bounded transcript of that discussion, and the diff under discussion (up to `MAX_DEBATE_DIFF`); GitLab additionally requires `MIN_ACCESS_LEVEL`. Bot and `[bot]` authors are ignored. Blank `BOT_USERNAME` disables it.
+- Debate: a GitLab note or GitHub comment that `@BOT_USERNAME` gets an in-thread answer — and inside a thread the bot opened, the reply alone is enough, no mention needed. Our own replies are never answered. Per-note dedupe, per-thread cooldown (`COOLDOWN_SECONDS`), a bounded transcript of that discussion, and the diff under discussion (up to `MAX_DEBATE_DIFF`); GitLab additionally requires `MIN_ACCESS_LEVEL`. Bot and `[bot]` authors are ignored. Blank `BOT_USERNAME` disables it.
 - A dropped connection (`Connection reset by peer`) during a platform API call is retried up to `API_ATTEMPTS` times with a short backoff instead of failing the review. HTTP errors (401/404) are not retried.
 - Diffs larger than `MAX_DIFF` (100,000 characters) are reviewed in chunks — several model calls over file and hunk boundaries, merged with the strictest verdict — instead of being rejected or truncated. API and Hermes errors are logged; retries and persistence are not guaranteed after acknowledgement.
 

@@ -880,12 +880,19 @@ class RemarkTests(unittest.TestCase):
 class DebateRemarkTests(unittest.TestCase):
     """A debate reply that does not happen must say why."""
 
+    def setUp(self):
+        # Both maps are module globals keyed by the note, and every fixture reuses
+        # note id 9 — without a reset the first test answers for all the others.
+        server._replied.clear()
+        server._cooldown.clear()
+
     def run_debate(self, payload, bot="santosodb"):
         seen = {}
         old = server.BOT_USERNAME
         server.BOT_USERNAME = bot
         try:
-            with patch.object(server, "api"), patch.object(server, "run_hermes") as hermes:
+            with patch.object(server, "api"), patch.object(server, "run_hermes") as hermes, \
+                    patch.object(server, "api_json", return_value=[]):
                 result = server.debate("gitlab", payload, GL_CONFIG, lambda stage, **kw: seen.update(kw))
         finally:
             server.BOT_USERNAME = old
@@ -903,6 +910,59 @@ class DebateRemarkTests(unittest.TestCase):
 
     def test_no_mention(self):
         _, seen, _ = self.run_debate(self.note("looks good"))
+        self.assertIn("does not mention", seen["remark"])
+
+    def test_reply_in_our_thread_needs_no_mention(self):
+        """A human answering our inline finding is already addressing us."""
+        seen = {}
+        old = server.BOT_USERNAME
+        server.BOT_USERNAME = "santosodb"
+        ours = [{"id": "d1", "notes": [
+            {"author": {"username": "santosodb"}, "body": "<!-- ai-review -->\nfinding"},
+            {"author": {"username": "alice"}, "body": "good catch, fixed"}]}]
+        try:
+            server._replied.clear()
+            with patch.object(server, "api_json", return_value=ours), \
+                    patch.object(server, "api"), \
+                    patch.object(server, "run_hermes", return_value="thanks"), \
+                    patch.object(server, "gl_access_level", return_value=40), \
+                    patch.object(server, "gl_thread", return_value=""), \
+                    patch.object(server, "bounded_diff", return_value=""):
+                posted = server.debate("gitlab", self.note("good catch, fixed"), GL_CONFIG,
+                                       lambda stage, **kw: seen.update(kw))
+        finally:
+            server.BOT_USERNAME = old
+        self.assertTrue(posted)
+        self.assertNotIn("remark", seen)
+
+    def test_no_mention_outside_our_thread_still_skips(self):
+        """Someone else's discussion is not an address; the mention stays required."""
+        seen = {}
+        old = server.BOT_USERNAME
+        server.BOT_USERNAME = "santosodb"
+        theirs = [{"id": "d1", "notes": [
+            {"author": {"username": "bob"}, "body": "unrelated thread"}]}]
+        try:
+            server._replied.clear()
+            with patch.object(server, "api_json", return_value=theirs):
+                posted = server.debate("gitlab", self.note("looks good"), GL_CONFIG,
+                                       lambda stage, **kw: seen.update(kw))
+        finally:
+            server.BOT_USERNAME = old
+        self.assertFalse(posted)
+        self.assertIn("does not mention", seen["remark"])
+
+    def test_our_thread_lookup_failing_falls_back_to_requiring_the_mention(self):
+        seen = {}
+        old = server.BOT_USERNAME
+        server.BOT_USERNAME = "santosodb"
+        try:
+            with patch.object(server, "api_json", side_effect=URLError("down")):
+                posted = server.debate("gitlab", self.note("looks good"), GL_CONFIG,
+                                       lambda stage, **kw: seen.update(kw))
+        finally:
+            server.BOT_USERNAME = old
+        self.assertFalse(posted)
         self.assertIn("does not mention", seen["remark"])
 
     def test_own_reply(self):
