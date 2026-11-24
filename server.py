@@ -165,6 +165,8 @@ class Tracker:
         self.live = {}
         self.done = collections.deque(maxlen=limit)
         self.seq = 0
+        self.changed = threading.Condition()  # wakes dashboard streams on any change
+        self.version = 0
         self._load()
 
     def _load(self):
@@ -197,12 +199,22 @@ class Tracker:
                    "duration": 0.0, "verdict": "", "inline": 0, "files": files, "error": "",
                    "remark": ""}
             self.live[self.seq] = rec
-            return rec
+        self.bump()
+        return rec
+
+    def bump(self):
+        """Announce a change. Subscribers re-read the snapshot; no event payload to drift."""
+        with self.changed:
+            self.version += 1
+            self.changed.notify_all()
 
     def stage(self, rec, name):
         if rec is not None:
             with self.lock:
+                if rec["stage"] == name:
+                    return  # no change, no wake-up
                 rec["stage"] = name
+            self.bump()
 
     def finish(self, rec, status="done", **fields):
         """Move a job out of the live map into history, and persist it."""
@@ -222,6 +234,7 @@ class Tracker:
                         fh.write(json.dumps(rec) + "\n")
                 except OSError:
                     LOG.warning("cannot append to review store %s", self.path)
+        self.bump()
 
     def snapshot(self):
         now = time.time()
@@ -1226,7 +1239,10 @@ def triggers_review(platform, event, payload):
         return False
     try:
         if is_note_event(platform, payload):
-            return True
+            # Our own review comments echo back as note hooks. They can never
+            # produce a review, and recording them buried the dashboard in 101
+            # skipped rows, so drop them here like any other push hook.
+            return not is_own_comment(platform, payload)
         if platform == "gitlab":
             attrs = payload.get("object_attributes")
             if (event != "Merge Request Hook" or payload.get("object_kind") != "merge_request"
@@ -1256,6 +1272,25 @@ def repo_enabled(platform, payload):
     if not REVIEW_REPOS:
         return True
     return repo_of(platform, payload) in REVIEW_REPOS
+
+
+def is_own_comment(platform, payload):
+    """True when this note is our own output echoing back, so no reply is owed.
+
+    Every comment we post carries REVIEW_MARKER, and the platform then sends a
+    note hook for it. Such a note can never produce a review, and recording it
+    buried the dashboard under 101 `skipped` rows. The marker alone is not the
+    test — a human may quote us — so a note that still mentions the bot is left
+    alone and answered normally.
+    """
+    try:
+        if platform == "gitlab":
+            text = (payload.get("object_attributes") or {}).get("note") or ""
+        else:
+            text = (payload.get("comment") or {}).get("body") or ""
+    except AttributeError:
+        return False
+    return REVIEW_MARKER in text and not bot_mentioned(text)
 
 
 def is_note_event(platform, payload):
@@ -1311,6 +1346,9 @@ def release(platform, raw):
         _seen.pop((platform, hashlib.sha256(raw).digest()), None)
 
 
+STREAMS = threading.BoundedSemaphore(16)  # each open SSE connection pins one thread
+
+
 class Handler(BaseHTTPRequestHandler):
     timeout = 15  # socket read/idle timeout; slow clients cannot pin a thread
 
@@ -1335,14 +1373,57 @@ class Handler(BaseHTTPRequestHandler):
             if not self.authorized():
                 return self.unauthorized()
             return self.reply(200, DASHBOARD_HTML, "text/html; charset=utf-8")
+        if path == "/api/events":
+            if not self.authorized():
+                return self.unauthorized()
+            return self.stream()
         if path == "/api/reviews":
             if not self.authorized():
                 return self.unauthorized()
-            data = _tracker.snapshot()
-            data["stats"]["queued"] = _jobs.qsize()
-            data["stats"]["workers"] = MAX_WORKERS
-            return self.reply(200, json.dumps(data), "application/json")
+            return self.reply(200, self.payload(), "application/json")
         self.respond(404, "not found")
+
+    def payload(self):
+        """The dashboard's whole state: one snapshot, same shape the poller got."""
+        data = _tracker.snapshot()
+        data["stats"]["queued"] = _jobs.qsize()
+        data["stats"]["workers"] = MAX_WORKERS
+        return json.dumps(data)
+
+    def stream(self):
+        """Server-Sent Events: push a snapshot whenever a review changes.
+
+        Server-to-browser only, so SSE does the job with no handshake, no frame
+        masking and no new dependency. `EventSource` reconnects on its own.
+        """
+        if not STREAMS.acquire(blocking=False):
+            return self.respond(503, "too many dashboard streams")
+        try:
+            self.close_connection = True
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.send_header("X-Accel-Buffering", "no")  # cloudflared/nginx: do not buffer
+            self.end_headers()
+            self.wfile.flush()
+            seen = -1
+            while True:
+                with _tracker.changed:
+                    if _tracker.version == seen:
+                        _tracker.changed.wait(timeout=15)
+                    version = _tracker.version
+                if version == seen:
+                    self.wfile.write(b": ping\n\n")  # idle heartbeat; keeps the socket warm
+                    self.wfile.flush()
+                    continue
+                seen = version
+                self.wfile.write(b"data: " + self.payload().encode() + b"\n\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass  # browser tab closed
+        finally:
+            STREAMS.release()
 
     def authorized(self):
         """HTTP Basic auth: the browser's own login prompt, no token in the URL.

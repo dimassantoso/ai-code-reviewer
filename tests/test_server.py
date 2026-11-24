@@ -1102,6 +1102,114 @@ class ResolveThreadTests(unittest.TestCase):
         api_json.assert_not_called()
 
 
+class OwnCommentFilterTests(unittest.TestCase):
+    """Our own review comments echo back as note hooks; they must not create rows."""
+
+    def setUp(self):
+        self.saved = server.BOT_USERNAME
+        server.BOT_USERNAME = "santosodb"
+
+    def tearDown(self):
+        server.BOT_USERNAME = self.saved
+
+    def note(self, body, author="santosodb"):
+        return {"object_kind": "note", "user": {"username": author},
+                "object_attributes": {"note": body, "noteable_type": "MergeRequest",
+                                      "noteable_iid": 1, "id": 9}}
+
+    def test_our_review_comment_is_dropped(self):
+        payload = self.note(server.REVIEW_MARKER + "\n### Summary\nlooks fine")
+        self.assertFalse(server.triggers_review("gitlab", "Note Hook", payload))
+
+    def test_human_mention_still_triggers(self):
+        payload = self.note("hey @santosodb why is this slow?", author="alice")
+        self.assertTrue(server.triggers_review("gitlab", "Note Hook", payload))
+
+    def test_a_human_quoting_our_comment_still_triggers(self):
+        """The marker alone is not proof: the author decides."""
+        payload = self.note("> " + server.REVIEW_MARKER + "\nwhat does this mean @santosodb?",
+                            author="alice")
+        self.assertTrue(server.triggers_review("gitlab", "Note Hook", payload))
+
+    def test_github_bot_comment_is_dropped(self):
+        payload = {"action": "created",
+                   "comment": {"body": server.REVIEW_MARKER + "\nsummary",
+                               "user": {"login": "santosodb"}},
+                   "issue": {"number": 3}}
+        self.assertFalse(server.triggers_review("github", "issue_comment", payload))
+
+    def test_github_human_comment_triggers(self):
+        payload = {"action": "created",
+                   "comment": {"body": "@santosodb take a look", "user": {"login": "alice"}},
+                   "issue": {"number": 3}}
+        self.assertTrue(server.triggers_review("github", "issue_comment", payload))
+
+
+class EventStreamTests(unittest.TestCase):
+    """SSE endpoint: pushes a snapshot on change instead of being polled."""
+
+    def setUp(self):
+        self.tracker = server.Tracker(path=None)
+        self.saved = server._tracker
+        self.saved_password = server.DASHBOARD_PASSWORD
+        server._tracker = self.tracker
+        server.DASHBOARD_PASSWORD = ""  # the stream is behind the same Basic auth
+
+    def tearDown(self):
+        server._tracker = self.saved
+        server.DASHBOARD_PASSWORD = self.saved_password
+
+    def test_bump_wakes_a_waiting_subscriber(self):
+        woke = []
+
+        def wait():
+            with self.tracker.changed:
+                before = self.tracker.version
+                self.tracker.changed.wait_for(lambda: self.tracker.version != before, timeout=2)
+                woke.append(self.tracker.version)
+
+        thread = threading.Thread(target=wait, daemon=True)
+        thread.start()
+        time.sleep(0.05)
+        self.tracker.begin("gitlab", "g/p!1", "dimas")
+        thread.join(2)
+        self.assertEqual(len(woke), 1)
+        self.assertGreater(woke[0], 0)
+
+    def test_stage_change_bumps_but_a_repeat_does_not(self):
+        rec = self.tracker.begin("gitlab", "g/p!1")
+        version = self.tracker.version
+        self.tracker.stage(rec, "reviewing")
+        self.assertEqual(self.tracker.version, version + 1)
+        self.tracker.stage(rec, "reviewing")
+        self.assertEqual(self.tracker.version, version + 1)
+
+    def test_finish_bumps(self):
+        rec = self.tracker.begin("gitlab", "g/p!1")
+        version = self.tracker.version
+        self.tracker.finish(rec, "done")
+        self.assertEqual(self.tracker.version, version + 1)
+
+    def test_stream_pushes_a_snapshot_without_being_polled(self):
+        """Open /api/events, change nothing, and a frame still arrives immediately."""
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        httpd.config = {}
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        try:
+            response = urlopen(f"http://127.0.0.1:{httpd.server_address[1]}/api/events", timeout=5)
+            self.assertEqual(response.headers["Content-Type"], "text/event-stream; charset=utf-8")
+            line = response.readline()
+            self.assertTrue(line.startswith(b"data: "), line)
+            self.assertEqual(response.readline(), b"\n")  # blank line ends the frame
+            data = json.loads(line[len(b"data: "):])
+            self.assertIn("stats", data)
+            self.assertEqual(data["stats"]["workers"], server.MAX_WORKERS)
+            response.close()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
 class AuthorColumnTests(unittest.TestCase):
     """The dashboard's MR-author column must actually fill in."""
 
@@ -1439,7 +1547,7 @@ class DashboardTests(unittest.TestCase):
         status, page = self.get("/dashboard")
         self.assertEqual(status, 200)
         self.assertIn("AI Code Reviewer", page)
-        self.assertIn("/api/reviews", page)
+        self.assertIn("/api/events", page)  # streams; the poll endpoint is the fallback
         status, body = self.get("/api/reviews")
         self.assertEqual(status, 200)
         data = json.loads(body)
