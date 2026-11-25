@@ -12,7 +12,7 @@ Docker — one command, no Python or Hermes install needed:
 
 ```bash
 git clone https://github.com/dimassantoso/ai-code-reviewer && cd ai-code-reviewer
-cp .env.example .env      # fill one token + its webhook secret
+make init                 # wizard: platform token, webhook secret, model, dashboard -> .env
 mkdir -p hermes-home && printf 'HERMES_UID=%s\nHERMES_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
 docker compose up -d --build
 docker compose exec reviewer hermes setup   # provider login, once
@@ -23,7 +23,7 @@ Python direct — requires Hermes already installed and authenticated:
 
 ```bash
 git clone https://github.com/dimassantoso/ai-code-reviewer && cd ai-code-reviewer
-cp .env.example .env      # fill one token + its webhook secret
+make init                 # wizard: platform token, webhook secret, model, dashboard -> .env
 set -a; . ./.env; set +a
 python3 server.py
 ```
@@ -33,7 +33,7 @@ Point the platform webhook at `https://<host>/gl-review` or `https://<host>/gh-r
 
 ## Configuration
 
-Copy `.env.example` to `.env` and fill in at least one platform token and its webhook secret. Protect this file and never commit it. Set up a dedicated Hermes home with a working provider and model; see the [Hermes documentation](https://hermes-agent.nousresearch.com/docs/).
+`make init` asks for everything below and writes `.env` (mode 600, previous file backed up). It checks each token against the platform API, generates the webhook secrets and dashboard password, finds the `hermes` binary, can run one harmless review to prove the model works, and offers to install the skill and a systemd user service. Re-run it at any time: current values are the defaults. `python3 tools/init.py --yes` runs it without questions. To do it by hand instead, copy `.env.example` to `.env` and fill in at least one platform token and its webhook secret. Protect this file and never commit it. Set up a dedicated Hermes home with a working provider and model; see the [Hermes documentation](https://hermes-agent.nousresearch.com/docs/).
 
 | Variable | Meaning |
 | --- | --- |
@@ -187,7 +187,17 @@ deploy overwrites it.
 
 ## Dashboard and access
 
-`GET /dashboard` shows live reviews (stage, elapsed, progress), totals, average and p95 duration, verdict counts and history. `GET /api/reviews` is the same data as JSON.
+`GET /dashboard` shows live reviews (stage, elapsed, progress), totals, average and p95 duration, verdict counts, conceded mistakes and history. `GET /api/reviews` is the same data as JSON.
+
+Row actions (each needs the dashboard login; the page sends an `X-Dashboard` header and the server refuses cross-site requests):
+
+- **Stop** (running row): kills the model call and every process it started, and marks the row `stopped`. A stop that arrives between steps takes effect before the next step, so nothing is posted after it.
+- **Re-review** (history row): queues a fresh review of that MR/PR, rebuilt from the row's URL. It skips the "already reviewed" and same-head guards, and carries the bot's open findings like a push re-review. A merged or closed MR is refused.
+- **Delete** (history row): removes the record from the page and from `REVIEW_STORE`. A running review must be stopped first.
+
+The same actions are plain HTTP for scripts: `POST /api/reviews/<id>/stop|rereview|delete` with `X-Dashboard: 1`.
+
+With `DASHBOARD_PASSWORD` blank, anyone who can reach the port can use these actions, so keep it blank only behind Tailscale or an access proxy.
 
 Access is HTTP Basic when `DASHBOARD_PASSWORD` is set — the browser's own login prompt, no token in the URL, nothing to leak in bookmarks or referrers. Blank password leaves it open, which is only acceptable when a proxy does the gating.
 

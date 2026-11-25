@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A webhook service (`server.py`, **Python stdlib only — no third-party packages, keep it that way**) that reviews GitLab merge requests and GitHub pull requests. It fetches the diff, sends it to the **Hermes Agent CLI** (`hermes chat ...`) as a subprocess, parses the model output, and posts inline comments, a summary and optionally an approval. `dashboard.html` is a single-file live dashboard served by the same process. `tools/add_repo.py` installs the webhook on a repo.
 
+`tools/init.py` (`make init`) is the setup wizard that writes `.env`. Its `SECTIONS` list is the catalogue of settings, so add any new env var there and in `.env.example`.
+
 `SKILL.md` is the **Hermes skill**: the review rubric and output contract that is loaded into every model call (`hermes chat -s $HERMES_SKILL`). It is prompt material for the reviewing model, not docs for this codebase. Reviews run with empty toolsets, so the model sees only the prompt and SKILL.md. Keep the skill as one self-contained file, because the model can't open files next to it.
 - Its "Output format" section, `REVIEW_FORMAT` in `server.py`, and the parsers (`parse_inline_comments`, `verdict_of`, `strip_inline`) form one contract. Change all three together.
 - The live copy lives in the Hermes home (with `HERMES_PROFILE` set: `$HERMES_HOME/profiles/<profile>/skills/.../ai-code-reviewer/`). `make skill` installs the repo version and keeps a `.bak` of the old one, and `make deploy` runs it. Never edit the installed copy directly. Installing changes live review behavior immediately, with no restart, so confirm with the user before running `make skill` or `make deploy`.
@@ -17,6 +19,7 @@ python3 -m unittest discover -s tests -v                    # full suite (also: 
 python3 -m unittest tests.test_server.ChunkedReviewTests -v  # one class
 python3 -m unittest tests.test_server.ChunkedReviewTests.test_name  # one test
 python3 tests/loadtest.py --requests 200 --concurrency 32 --workers 4
+make init                                                   # setup wizard -> .env (tests: tests/test_init.py)
 set -a; . ./.env; set +a; python3 server.py                 # run locally (server reads env, not .env)
 ```
 
@@ -50,6 +53,8 @@ Model I/O:
 - Everything the bot posts carries `REVIEW_MARKER` (`<!-- ai-review -->`). `is_own_comment()` uses it to drop the bot's own comments when they echo back as note hooks, and thread resolution uses it to tell bot threads from human ones.
 
 `api()` wraps `api_once()` and retries only transient connection errors (`API_ATTEMPTS`). It never retries HTTP errors, and it refuses redirects. A request with a body defaults to POST. Pass `method="PUT"` where the API requires it: GitLab resolves a discussion only with PUT (the old POST was a 404 in production), and GitHub dismisses a review with PUT. Test fakes of `api` often don't take `method`, so `api_json` passes it only when it is set.
+
+Dashboard actions: `POST /api/reviews/<id>/{stop,rereview,delete}` (`Handler.action`). They require `authorized()` plus `same_origin()` (an `X-Dashboard: 1` header, and Origin / Sec-Fetch-Site must match). Stop: `run_job` binds the tracker id to the worker thread (`_current.job`). `run_hermes` runs the CLI with `Popen(start_new_session=True)`, registered in `_procs`, so `stop_review` can kill the whole process group. `track()` raises `Stopped` on the next stage change, and the row ends as `stopped`. Re-review: `replay_of()` rebuilds a payload from the record URL with `_force: True`, which bypasses trigger gates, the head memory and the "already reviewed on open" check, and counts as a re-review. `collect_gitlab` resolves the project path to its numeric id and refuses MRs whose API state isn't `opened`. Delete: `Tracker.delete` filters the JSONL file (not just the in-memory window) and replaces it atomically.
 
 Dashboard: `Tracker` keeps live jobs in memory plus an append-only JSONL history, and fixes up old rows on `_load`. It notifies waiters through a `Condition`. `/api/events` is SSE, capped at 16 concurrent streams by the `STREAMS` semaphore. `/api/reviews` returns the full JSON snapshot. Both use HTTP Basic auth when `DASHBOARD_PASSWORD` is set.
 

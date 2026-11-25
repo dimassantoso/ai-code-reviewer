@@ -15,10 +15,13 @@ SC    := systemctl --user
 export XDG_RUNTIME_DIR ?= /run/user/$(shell id -u)
 
 .DEFAULT_GOAL := help
-.PHONY: help start stop restart status health dash url log logs password test deploy reset add skill mistakes
+.PHONY: help start stop restart status health dash url log logs password test deploy reset add skill mistakes init
 
 help:  ## list targets
 	@grep -E '^[a-z]+:.*## ' $(MAKEFILE_LIST) | sed 's/:.*## /\t/' | column -t -s "$$(printf '\t')"
+
+init:  ## setup wizard: platforms, tokens, model, dashboard -> .env (re-runnable)
+	@python3 $(DIR)/tools/init.py
 
 start:  ## start the service
 	$(SC) start $(UNIT) && sleep 2 && $(SC) is-active $(UNIT)

@@ -2182,12 +2182,9 @@ class HermesTests(unittest.TestCase):
         self.script('cat >/dev/null\nprintf "%s" "$*"\n')
         os.environ["HERMES_PROFILE"] = "codereview"
         server.run_hermes("diff")
-        # the stub cannot see argv, so assert the builder through a recorded run
-        recorded = []
-        with patch.object(server.subprocess, "run", side_effect=lambda cmd, **kw: recorded.append(cmd) or type("R", (), {"stdout": "ok"})()):
-            server.run_hermes("diff")
-        self.assertEqual(recorded[0][1:3], ["-p", "codereview"])
-        self.assertEqual(recorded[0][3], "chat")
+        cmd = server.hermes_command()
+        self.assertEqual(cmd[1:3], ["-p", "codereview"])
+        self.assertEqual(cmd[3], "chat")
 
     def test_strips_session_id_trailer(self):
         self.script('cat >/dev/null\nprintf "review text\\n\\nsession_id: local-abc\\n"\n')
@@ -2648,6 +2645,175 @@ class MemoryTests(unittest.TestCase):
             self.assertEqual(server.lessons_block("other/r"), "")
         finally:
             server._memory = saved
+
+
+class DashboardActionTests(unittest.TestCase):
+    """Stop, re-review and delete from the dashboard."""
+
+    MR = {"object_kind": "merge_request", "project": {"id": 1, "path_with_namespace": "acme/w"},
+          "object_attributes": {"iid": 2, "action": "open", "state": "opened",
+                                "url": "https://gitlab.com/acme/w/-/merge_requests/2"}}
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.saved = server._tracker
+        server._tracker = server.Tracker(os.path.join(self.dir, "r.jsonl"))
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        self.httpd.config = {"gitlab": {"token": "t", "secret": SECRET, "url": "https://gitlab.com"}}
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        server._tracker = self.saved
+
+    def post(self, path, headers=None):
+        request = Request(self.base + path, data=b"", method="POST",
+                          headers={"X-Dashboard": "1"} if headers is None else headers)
+        try:
+            with urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except HTTPError as error:
+            body = error.read()
+            try:
+                return error.code, json.loads(body)
+            except ValueError:
+                return error.code, body.decode()
+
+    def finished(self, url="https://gitlab.com/acme/w/-/merge_requests/2"):
+        rec = server._tracker.begin("gitlab", "acme/w!2", "alice", url=url)
+        server._tracker.finish(rec, "done", verdict="APPROVE")
+        return rec["id"]
+
+    def test_delete_removes_row_and_store_line(self):
+        keep, drop = self.finished(), self.finished()
+        self.assertEqual(self.post(f"/api/reviews/{drop}/delete")[0], 200)
+        self.assertEqual([r["id"] for r in server._tracker.snapshot()["history"]], [keep])
+        with open(server._tracker.path) as fh:
+            self.assertEqual([json.loads(l)["id"] for l in fh], [keep])
+        self.assertEqual(server.Tracker(server._tracker.path).snapshot()["history"][0]["id"], keep)
+        self.assertEqual(self.post(f"/api/reviews/{drop}/delete")[0], 404)
+
+    def test_running_review_cannot_be_deleted(self):
+        rec = server._tracker.begin("gitlab", "acme/w!2", "alice")
+        status, body = self.post(f"/api/reviews/{rec['id']}/delete")
+        self.assertEqual(status, 409)
+        self.assertIn("stop it first", body["message"])
+
+    def test_rereview_rebuilds_the_target_and_forces(self):
+        rid = self.finished()
+        with patch.object(server, "enqueue") as enqueue:
+            self.assertEqual(self.post(f"/api/reviews/{rid}/rereview")[0], 202)
+        platform, event, payload, cfg, raw, key = enqueue.call_args[0][0]
+        self.assertEqual((platform, event), ("gitlab", "Merge Request Hook"))
+        self.assertTrue(payload["_force"])
+        self.assertEqual(payload["project"]["id"], "acme%2Fw")
+        self.assertEqual(payload["object_attributes"]["iid"], 2)
+        self.assertTrue(server.is_rereview("gitlab", payload))
+
+    def test_rereview_refuses_foreign_host_or_missing_url(self):
+        for url in ("https://evil.example/acme/w/-/merge_requests/2", ""):
+            with self.subTest(url=url), patch.object(server, "enqueue") as enqueue:
+                self.assertEqual(self.post(f"/api/reviews/{self.finished(url)}/rereview")[0], 409)
+                enqueue.assert_not_called()
+
+    def test_github_replay(self):
+        payload = server.replay_of("https://api.github.com",
+                                   {"platform": "github", "url": "https://github.com/acme/w/pull/7"})
+        self.assertEqual((payload["number"], payload["repository"]["full_name"]), (7, "acme/w"))
+
+    def test_forced_replay_resolves_project_path_and_skips_guards(self):
+        server._reviewed.clear()
+
+        def fake_api_json(base, token, platform, path, body=None, accept="application/json", method=None):
+            if path == "/projects/acme%2Fw":
+                return {"id": 1, "permissions": {"project_access": {"access_level": 40}}}
+            if path == "/projects/1":
+                return {"permissions": {"project_access": {"access_level": 40}}}
+            if "/notes" in path:
+                return [{"body": "<!-- ai-review -->"}]  # reviewed before: a plain open would skip
+            if "/changes" in path:
+                return {"changes": [{"new_path": "a.py", "diff": "@@ -0,0 +1 @@\n+x"}], "overflow": False}
+            return {"author": {"username": "alice"}, "state": "opened", "title": "feat",
+                    "diff_refs": {"head_sha": "s"}}
+        payload = server.replay_of("https://gitlab.com", {"platform": "gitlab",
+                                   "url": "https://gitlab.com/acme/w/-/merge_requests/2"})
+        with patch.object(server, "api_json", side_effect=fake_api_json):
+            job = server.collect_gitlab(payload, GL_CONFIG)
+        self.assertIsInstance(job, dict)
+        self.assertEqual(job["pid"], 1)
+
+    def test_replay_of_merged_mr_is_refused(self):
+        def fake_api_json(base, token, platform, path, body=None, accept="application/json", method=None):
+            if path in ("/projects/acme%2Fw", "/projects/1"):
+                return {"id": 1, "permissions": {"project_access": {"access_level": 40}}}
+            if "/changes" in path:
+                return {"changes": [{"new_path": "a.py", "diff": "@@ -0,0 +1 @@\n+x"}], "overflow": False}
+            return [] if "/notes" in path else {"state": "merged"}
+        payload = server.replay_of("https://gitlab.com", {"platform": "gitlab",
+                                   "url": "https://gitlab.com/acme/w/-/merge_requests/2"})
+        with patch.object(server, "api_json", side_effect=fake_api_json):
+            self.assertIn("merged", server.collect_gitlab(payload, GL_CONFIG))
+
+    def test_stop_kills_the_running_model_call(self):
+        stub = os.path.join(self.dir, "hermes")
+        with open(stub, "w") as fh:
+            fh.write("#!/bin/sh\nsleep 30\n")
+        os.chmod(stub, 0o755)
+
+        def slow_process(platform, event, payload, cfg, track=None):
+            track("reviewing")
+            server.run_hermes("diff")
+            raise AssertionError("not reached")
+        started = time.time()
+        with patch.dict(os.environ, {"HERMES_BIN": stub}), patch.object(server, "process", side_effect=slow_process):
+            worker = threading.Thread(target=server.run_job,
+                                      args=("gitlab", "Merge Request Hook", self.MR, {}, b"raw", None))
+            worker.start()
+            deadline = time.time() + 5
+            while not server._procs and time.time() < deadline:
+                time.sleep(0.02)
+            rid = next(iter(server._tracker.live))
+            self.assertEqual(self.post(f"/api/reviews/{rid}/stop")[0], 202)
+            worker.join(10)
+        self.assertLess(time.time() - started, 10)
+        row = server._tracker.snapshot()["history"][0]
+        self.assertEqual((row["status"], row["remark"]), ("stopped", "stopped from the dashboard"))
+        self.assertEqual(server._procs, {})
+        self.assertEqual(self.post(f"/api/reviews/{rid}/stop")[0], 409)  # no longer running
+
+    def test_stop_between_steps_posts_nothing(self):
+        posted = []
+
+        def process(platform, event, payload, cfg, track=None):
+            server.stop_review(next(iter(server._tracker.live)))
+            track("posting")  # the next step notices the stop
+            posted.append(1)
+        with patch.object(server, "process", side_effect=process):
+            server.run_job("gitlab", "Merge Request Hook", self.MR, {}, b"raw", None)
+        self.assertEqual(posted, [])
+        self.assertEqual(server._tracker.snapshot()["history"][0]["status"], "stopped")
+
+    def test_cross_site_requests_are_refused(self):
+        rid = self.finished()
+        self.assertEqual(self.post(f"/api/reviews/{rid}/delete", headers={})[0], 403)  # no X-Dashboard
+        self.assertEqual(self.post(f"/api/reviews/{rid}/delete",
+                                   headers={"X-Dashboard": "1", "Origin": "https://evil.example"})[0], 403)
+        self.assertEqual(self.post(f"/api/reviews/{rid}/delete",
+                                   headers={"X-Dashboard": "1", "Sec-Fetch-Site": "cross-site"})[0], 403)
+        self.assertEqual(len(server._tracker.snapshot()["history"]), 1)
+
+    def test_actions_need_the_dashboard_login(self):
+        rid = self.finished()
+        with patch.object(server, "DASHBOARD_PASSWORD", "pw"):
+            self.assertEqual(self.post(f"/api/reviews/{rid}/delete")[0], 401)
+            auth = "Basic " + base64.b64encode(b"admin:pw").decode()
+            self.assertEqual(self.post(f"/api/reviews/{rid}/delete",
+                                       headers={"X-Dashboard": "1", "Authorization": auth})[0], 200)
+
+    def test_unknown_action_is_404(self):
+        self.assertEqual(self.post("/api/reviews/1/explode")[0], 404)
 
 
 if __name__ == "__main__":
