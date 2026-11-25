@@ -1,227 +1,179 @@
 # ai-code-reviewer
 
-![Setup and usage walkthrough](images/tutorial.gif)
+An AI reviewer for GitLab merge requests and GitHub pull requests. It reviews when someone asks, posts inline findings and a summary, approves clean changes, answers replies in its threads, and learns from the findings it got wrong.
 
-Python stdlib webhook service for GitLab merge requests and GitHub pull requests. It fetches diffs, calls the Hermes Agent CLI, and posts review feedback. Hermes and a configured model provider are required; the server has no Python package dependencies.
+![Dashboard tour: overview, merge request list, detail timeline, dark mode](images/dashboard.gif)
 
-Choose **Python direct** to use an existing host Hermes installation, or **Docker** to run the server with Hermes included in the image. Neither mode includes model credentials.
+- **One small service.** `server.py` is Python standard library only. The model runs through the [Hermes Agent](https://hermes-agent.nousresearch.com/docs/) CLI, so any provider Hermes supports works.
+- **Reviews on request, not on every push.** Opening an MR, marking it ready, adding the bot as reviewer, or commenting `@bot review`.
+- **A consistent second pass.** A re-review sees its own open findings, drops the fixed ones, resolves their threads and withdraws an approval when it now requests changes.
+- **It argues fairly.** Replies to its comments get a decision first (answer, defend, concede, or stay quiet). Conceded findings are stored and fed into later reviews of the same repo.
+- **A live dashboard** with one row per merge request, a timeline per merge request, and stop / re-review / delete actions.
 
-## Two ways to run
+## Quick start
 
-Docker — one command, no Python or Hermes install needed:
+![make init: the setup wizard](images/setup.gif)
 
 ```bash
 git clone https://github.com/dimassantoso/ai-code-reviewer && cd ai-code-reviewer
-make init                 # wizard: platform token, webhook secret, model, dashboard -> .env
+make init        # asks for the platform token, webhook secret, model and dashboard login, writes .env
+```
+
+`make init` checks the token against the platform API, generates the webhook secret and dashboard password, finds `hermes`, can run one harmless review to prove the model answers, and offers to install the review skill and a systemd user service. Run it again any time; the current values are the defaults. `python3 tools/init.py --yes` runs it without questions.
+
+Then start the server one of two ways.
+
+**Docker** (Hermes is included in the image):
+
+```bash
 mkdir -p hermes-home && printf 'HERMES_UID=%s\nHERMES_GID=%s\n' "$(id -u)" "$(id -g)" >> .env
 docker compose up -d --build
-docker compose exec reviewer hermes setup   # provider login, once
+docker compose exec reviewer hermes setup     # provider login, once
 curl -fsS http://127.0.0.1:9877/health
 ```
 
-Python direct — requires Hermes already installed and authenticated:
+**Python** (Hermes already installed and logged in on the host):
 
 ```bash
-git clone https://github.com/dimassantoso/ai-code-reviewer && cd ai-code-reviewer
-make init                 # wizard: platform token, webhook secret, model, dashboard -> .env
 set -a; . ./.env; set +a
 python3 server.py
 ```
 
-Point the platform webhook at `https://<host>/gl-review` or `https://<host>/gh-review`. Details for each mode below.
+Finally, connect a repository:
 
+```bash
+make add REPO=group/project        # GitLab
+make add REPO=owner/repo           # GitHub
+```
+
+`make add` creates (or updates) the webhook at `$PUBLIC_URL/gl-review` or `$PUBLIC_URL/gh-review`. Open `http://<host>:9877/dashboard` and open a merge request to see the first review.
+
+## When a review runs
+
+Only when someone asks for one.
+
+| Request | GitLab | GitHub |
+| --- | --- | --- |
+| A new MR / PR | opened (drafts wait) | opened (drafts wait) |
+| A draft is ready | marked ready | ready for review |
+| Ask the bot | add it as a reviewer | request its review, or press **Re-request review** |
+| Ask in a comment | `@bot review` | `@bot review` |
+| From the dashboard | **Re-review** button | **Re-review** button |
+
+The comment command also accepts `re-review` and `recheck`, with or without "please" or "can you". The bot reacts 👀 so the requester knows it was picked up.
+
+**Pushing commits never starts a review**, and neither do title, label or description edits or a reopen. GitLab sends no reliable event for its own "re-request review" button, so on GitLab use the comment, or remove the bot as reviewer and add it again. `BOT_USERNAME` must be the token account's username for reviewer requests to match.
+
+What a review posts:
+
+- Inline comments on lines in the diff, grouped as 🔴 Critical, ⚠️ Warning and 💡 Suggestion, each with a concrete fix (at most `MAX_INLINE`, default 20).
+- A summary comment and a verdict. `APPROVE` approves the MR when the token account is allowed to; `REQUEST_CHANGES` withdraws the bot's earlier approval.
+- On a re-review, threads for findings that are now fixed are resolved. Only the bot's own threads are closed, and never one a person has replied in.
+
+Big diffs are split into parts (`MAX_DIFF` characters each) and reviewed within `REVIEW_BUDGET_S`; the strictest verdict wins, and parts that were not reached are named in the summary. A result is thrown away if the MR moved to a newer commit while the model was thinking.
+
+## Talking to the bot
+
+Reply in one of the bot's threads, or mention `@bot` anywhere on the MR. Before anything is posted, one model call picks a stance:
+
+| Stance | When | What happens |
+| --- | --- | --- |
+| `NO_REPLY` | "thanks", "fixed", off-topic | nothing is posted |
+| `ANSWER` | a question | a short explanation |
+| `DEFEND` | pushback without a good reason | the point, once, with evidence |
+| `CONCEDE` | pushback with a sound reason | "You're right …", the thread is resolved, and the finding is saved as a lesson |
+
+Lessons live in `MEMORY_DB` (SQLite). The latest `LESSONS_IN_PROMPT` for a repo go into every later review of that repo, so the same false positive is not raised again. `make mistakes` lists them. On GitHub the concession is saved but the thread stays open, because GitHub has no REST call to resolve it.
+
+Cheap checks run before the model: the bot ignores its own comments, other bots, users below `MIN_ACCESS_LEVEL` (GitLab) and repeat comments within `COOLDOWN_SECONDS`.
+
+## Dashboard
+
+`/dashboard` updates live over Server-Sent Events. It has a light and a dark theme.
+
+- **Overview:** reviews in the selected range, approval rate, failures, average and p95 duration, inline comments, lessons learned, a reviews-per-day chart and the reviews running now.
+- **Merge requests:** one row per MR/PR with its latest verdict, run count and last run. Filter by range, status (skipped runs are hidden by default) or text.
+- **Detail page:** click a row for that MR's timeline: every run with its verdict, files, inline comments, duration and error, newest first.
+
+Actions:
+
+- **Stop** a running review. The model process is killed and nothing more is posted.
+- **Re-review** an MR. Queues a fresh review that carries the bot's open findings. Merged or closed MRs are refused.
+- **Delete** one run from the timeline. It is removed from `REVIEW_STORE` too.
+
+Actions need the dashboard login and an `X-Dashboard: 1` header, and cross-site requests are refused. Scripts can call `POST /api/reviews/<id>/stop|rereview|delete`. `GET /api/reviews` returns the whole snapshot as JSON.
 
 ## Configuration
 
-`make init` asks for everything below and writes `.env` (mode 600, previous file backed up). It checks each token against the platform API, generates the webhook secrets and dashboard password, finds the `hermes` binary, can run one harmless review to prove the model works, and offers to install the skill and a systemd user service. Re-run it at any time: current values are the defaults. `python3 tools/init.py --yes` runs it without questions. To do it by hand instead, copy `.env.example` to `.env` and fill in at least one platform token and its webhook secret. Protect this file and never commit it. Set up a dedicated Hermes home with a working provider and model; see the [Hermes documentation](https://hermes-agent.nousresearch.com/docs/).
+`make init` writes all of this to `.env` (mode 600, the old file backed up). To do it by hand, copy `.env.example`. The server reads the environment, not `.env` itself: Docker Compose loads it through `env_file`, and a direct run must export it.
 
 | Variable | Meaning |
 | --- | --- |
-| `GITLAB_TOKEN`, `GITHUB_TOKEN` | API credentials; configure at least one. GitLab needs API access; GitHub needs repository pull request read/write access. |
-| `GITLAB_WEBHOOK_SECRET`, `GITHUB_WEBHOOK_SECRET` | Required for each configured platform; `WEBHOOK_SECRET` is a shared fallback. Use separate random secrets. |
-| `GITLAB_URL`, `GITHUB_URL` | HTTPS API base URLs; defaults are `https://gitlab.com` and `https://api.github.com`. For GitHub Enterprise include `/api/v3`. |
-| `BIND_HOST`, `BIND_PORT` | Listen address and comma-separated ports; defaults `0.0.0.0` and `9877`. |
-| `HERMES_BIN` | CLI executable; default `hermes` on PATH. |
-| `HERMES_MODEL` | Optional model override; otherwise use Hermes configuration. |
-| `HERMES_SKILL` | Optional skill name; example sets `ai-code-reviewer`. |
-| `HERMES_PROFILE` | Optional Hermes profile, passed as `-p`. |
-| `HERMES_TIMEOUT_S` | Timeout for one model call, in seconds; default `300`. |
-| `MAX_DIFF` | Diff characters per model call; larger diffs are split into chunks. Default `30000`, sized so one call finishes inside the timeout. |
-| `REVIEW_BUDGET_S` | Wall-clock budget for all model calls in one review. Chunks not reached in time are skipped and named in the posted comment. Default `1200`. |
-| `REVIEW_REPOS` | Comma-separated `group/project` or `owner/repo` allowlist. Empty reviews every repo that sends a hook. |
-| `MAX_WORKERS` | Concurrent reviews; each one runs a `hermes` subprocess. Default `4`. |
-| `QUEUE_SIZE` | Pending reviews held before new webhooks get `503`. Default `100`. |
-| `BOT_USERNAME` | GitLab username to answer mentions. Blank disables debate replies entirely. |
-| `MIN_ACCESS_LEVEL` | GitLab access level required to review/reply. Default `30` (Developer). |
-| `APPROVE_ACCESS_LEVEL` | Access level required for auto-approve. Default `40` (Maintainer). |
-| `COOLDOWN_SECONDS` | Per-user per-thread debate cooldown. Default `30`. |
-| `MAX_INLINE` | Inline comments posted per review. Default `20`. |
-| `API_ATTEMPTS` | Tries per platform API call when the connection resets. Default `3`. HTTP errors are never retried. |
-| `DASHBOARD_USER`, `DASHBOARD_PASSWORD` | HTTP Basic auth for `/dashboard` and `/api/reviews`. Blank password leaves them open; the browser shows its own login prompt, so no token in the URL. |
-| `REVIEW_STORE` | Optional JSONL path for review history. Unset keeps history in memory only (lost on restart). |
-| `REVIEW_EST_S` | Expected review duration, used to scale the progress bar. Default `60`. |
-| `MEMORY_DB` | SQLite file of findings the bot conceded were wrong (stdlib `sqlite3`, WAL). Blank disables learning. Example: `./reviewer.db`. |
-| `LESSONS_IN_PROMPT` | How many recent conceded findings for the same repo are added to each review prompt. Default `10`. |
+| `GITLAB_TOKEN`, `GITHUB_TOKEN` | API tokens; set at least one. GitLab needs API scope; GitHub needs pull request read/write. |
+| `GITLAB_WEBHOOK_SECRET`, `GITHUB_WEBHOOK_SECRET` | Required for each platform you use. `WEBHOOK_SECRET` is a shared fallback. |
+| `GITLAB_URL`, `GITHUB_URL` | API base URLs. Defaults `https://gitlab.com` and `https://api.github.com`; GitHub Enterprise adds `/api/v3`. |
+| `PUBLIC_URL` | The public base URL the platforms call; used by `make add`. |
+| `BIND_HOST`, `BIND_PORT` | Listen address and comma-separated ports. Defaults `0.0.0.0` and `9877`. |
+| `BOT_USERNAME` | The token account's username. Needed for reviewer requests, `@bot review` and replies; blank turns replies off. |
+| `HERMES_BIN`, `HERMES_PROFILE`, `HERMES_MODEL` | The CLI, an optional profile (`-p`) and an optional model override. |
+| `HERMES_SKILL` | The review skill loaded into every call. Default `ai-code-reviewer`. |
+| `HERMES_TIMEOUT_S` | Timeout for one model call. Default `300`. |
+| `MAX_DIFF` | Diff characters per model call; larger diffs are split. Default `30000`. |
+| `REVIEW_BUDGET_S` | Time budget for all calls of one review. Default `1200`. |
+| `MAX_INLINE` | Inline comments per review. Default `20`. |
+| `REVIEW_REPOS` | Comma-separated allowlist of `group/project` or `owner/repo`. Empty allows every repo that sends a hook. |
+| `MIN_ACCESS_LEVEL`, `APPROVE_ACCESS_LEVEL` | GitLab access needed to review or reply (default `30`, Developer) and to approve (default `40`, Maintainer). |
+| `COOLDOWN_SECONDS` | Per-user, per-thread reply cooldown. Default `30`. |
+| `MAX_WORKERS`, `QUEUE_SIZE` | Concurrent reviews (default `4`) and queued reviews before webhooks get `503` (default `100`). |
+| `API_ATTEMPTS` | Tries per platform call when the connection drops. Default `3`; HTTP errors are never retried. |
+| `DASHBOARD_USER`, `DASHBOARD_PASSWORD` | HTTP Basic login for the dashboard and its API. A blank password leaves them open. |
+| `REVIEW_STORE` | JSONL file for review history. Unset keeps history in memory only. |
+| `MEMORY_DB`, `LESSONS_IN_PROMPT` | SQLite file for conceded findings (blank turns learning off) and how many go into each prompt (default `10`). |
 
-The server reads environment variables, not `.env` itself. Docker Compose loads `.env` via `env_file`; direct Python users must export it. Use shell-compatible values if sourcing the file.
+## The review skill
 
-## Python direct
+`SKILL.md` is the rubric and output format loaded into every model call: what the model can see, the seven review gates, checks per language, the verdict rules and the reply rules. Edit it in this repo and install it with `make skill`, which copies it into the Hermes home (`HERMES_HOME`, `HERMES_PROFILE`) and keeps a `.bak` of the previous one. The change applies to the next review without a restart. Don't edit the installed copy; the next `make deploy` overwrites it.
 
-Install and configure [Hermes Agent](https://hermes-agent.nousresearch.com/docs/), including provider authentication. Install this checkout as a local skill in the dedicated Hermes home:
+## Running it on a server
 
 ```bash
-export HERMES_HOME="$HOME/.hermes-reviewer"
-mkdir -p "$HERMES_HOME/skills/ai-code-reviewer"
-cp SKILL.md "$HERMES_HOME/skills/ai-code-reviewer/"   # or: make skill (reads HERMES_HOME/HERMES_PROFILE from .env)
-hermes setup
-hermes skills list
-cp .env.example .env
-# Edit .env privately.
-set -a; . ./.env; set +a
-python3 server.py
+make status | restart | health | log | logs   # the systemd user service
+make dash                                     # dashboard URL and where the password lives
+make password NEW=secret                      # change the dashboard password and restart
+make skill                                    # install SKILL.md into the Hermes home
+make mistakes                                 # lessons learned, newest first (N=20)
+make reset                                    # wipe review history (asks first, keeps a backup)
+make deploy                                   # git reset --hard origin/master, install the skill, restart
 ```
 
-Keep `HERMES_HOME` set for both Hermes setup and server execution. Verify the provider and skill using the same CLI options as the service:
+`make deploy` throws away local changes in the checkout, so commit first.
+
+**Docker notes.** The image extends the official Hermes Agent image, pinned by digest, and bundles `SKILL.md`. `./hermes-home` holds the Hermes config and provider credentials at `/opt/data`; treat it as a secret, and never mount your personal Hermes home. Compose publishes only `127.0.0.1:9877`, so put an HTTPS proxy or tunnel in front for webhooks.
+
+**Exposing the dashboard.** Pick one:
+
+- **Tailscale.** `BIND_HOST=<tailscale-ip>`; only your tailnet can reach it.
+- **Cloudflare Zero Trust.** An Access policy on the dashboard host, `DASHBOARD_PASSWORD` blank. Keep `/gl-review` and `/gh-review` outside the policy, or webhooks are redirected to a login page.
+- **Basic auth on a private network.** Set `DASHBOARD_PASSWORD`.
+
+## How it works
+
+1. A webhook arrives at `/gl-review` or `/gh-review`. The signature is checked: the GitLab token or Standard Webhooks for GitLab, `X-Hub-Signature-256` for GitHub.
+2. Anything that is not a review request returns `200 ignored` and creates no dashboard row. Duplicate deliveries are dropped.
+3. The job joins a bounded queue and the webhook gets `202` at once, because platforms time webhooks out at 10 s.
+4. A worker fetches the diff, builds the prompt (diff, open findings, lessons) and runs `hermes chat` with no tools. Platform tokens are stripped from its environment.
+5. The output is parsed into inline comments, a summary and a verdict, and posted. Events for the same MR run one at a time.
+
+Review input is untrusted. Use a dedicated, least-privilege bot account, and read what the model posts before acting on it.
+
+**Limits.** Throughput is `MAX_WORKERS / review time`: 4 workers and 2-minute reviews give about 2 reviews a minute. The HTTP layer is not the bottleneck: about 40 webhooks a second on a 4-core ARM board. Dedupe, the reviewed-head memory and queued jobs live in memory and are lost on restart; review history and lessons persist.
+
+## Development
 
 ```bash
-printf 'Review this harmless diff: + return 1' | hermes chat --query-file - -t "" -Q --max-turns 5 -s ai-code-reviewer
-curl -fsS http://127.0.0.1:9877/health
-```
-
-## Docker Compose
-
-The Dockerfile extends the official Hermes Agent image pinned by digest. It includes the real Hermes CLI and bundles this skill; the upstream startup hook syncs bundled skills into the persistent Hermes home. Keep the image entrypoint: it initializes the home and drops privileges.
-
-```bash
-cp .env.example .env
-# Edit .env privately: platform token, webhook secret, HERMES_UID and HERMES_GID.
-mkdir -p hermes-home
-# Set HERMES_UID and HERMES_GID in .env to the output of id -u and id -g.
-docker compose up -d --build
-docker compose exec reviewer hermes setup
-# Configure provider authentication for this dedicated Hermes home.
-curl -fsS http://127.0.0.1:9877/health
-docker compose logs -f reviewer
-```
-
-`./hermes-home` persists Hermes config, credentials, sessions and logs at `/opt/data`. Treat it as sensitive. Do **not** mount an active personal Hermes home: it can contain messaging credentials and gateway configuration that starts other services. A fresh home has no configured provider. Run a harmless diff through the exact CLI command above using `docker compose exec -T reviewer sh -c '...'` before enabling webhooks. `health` only proves the HTTP listener works.
-
-Compose publishes only `127.0.0.1:9877` and forces the container listener to `0.0.0.0:9877`. Change the host side of `ports` if 9877 is occupied. For other container ports, update the port mapping and Docker healthcheck too. Use an HTTPS reverse proxy or tunnel to receive external webhooks; restrict access and retain signature verification.
-
-### Install the reviewer on another repo
-
-`make add` creates the webhook on the repo and proves it exists:
-
-```bash
-make add REPO=pasarpolis/newservice
-make add REPO=https://gitlab.com/pasarpolis/newservice
-make add REPO=owner/repo-on-github
-```
-
-It needs `PUBLIC_URL` in `.env` — the public base URL the platform calls, e.g.
-`https://reviewer.example.com`; the hook is pointed at `$PUBLIC_URL/gl-review` or
-`/gh-review`. GitLab gets `merge_requests_events` + `note_events` (push, tag, issue,
-wiki, pipeline, deployment and release events off); GitHub gets `pull_request`,
-`pull_request_review_comment` and `issue_comment`. Re-running on an installed repo
-**updates** the existing hook instead of creating a second one. Group/project and
-owner/repo are both accepted, from a slug, an HTTPS URL, an SSH URL or an MR/PR URL.
-
-`make reset` wipes review history — it asks first, writes a timestamped `.bak` next to
-the store, then restarts.
-
-## Webhooks and behavior
-
-- GitLab: configure `https://<host>/gl-review` for merge request events. The server accepts `X-Gitlab-Token` or Standard Webhooks signing headers; `whsec_` secrets must contain valid base64.
-- GitHub: configure `https://<host>/gh-review` for pull request events and JSON payloads. The server verifies `X-Hub-Signature-256`.
-- `GET /health` returns `200 ok`. A disabled platform returns `404`; an invalid signature returns `403`.
-- Webhooks that cannot produce a review — `Push Hook`, MR `close`/`merge`/label events, unrelated CI hooks — return `200 ignored` and are never recorded on the dashboard. Only real reviews and debate replies create a row.
-- `GET /dashboard` is a live review dashboard; `GET /api/reviews` is the same data as JSON. Both are read-only and ask for HTTP Basic login when `DASHBOARD_PASSWORD` is set.
-- Valid requests are acknowledged with `202 accepted` before background processing. This is not proof a review was posted; inspect logs and the MR/PR. Duplicate payloads are suppressed in memory for five minutes, not durably across restarts.
-- **A review runs only when it is asked for:**
-  - the MR/PR is **opened** (GitLab `open`, GitHub `opened`);
-  - a draft is **marked ready** (GitLab `update` whose top-level `changes.draft` goes true → false, GitHub `ready_for_review`);
-  - the bot is **added as a reviewer** (GitLab `update` whose `changes.reviewers` newly contains `BOT_USERNAME`; GitHub `review_requested` for `BOT_USERNAME`, which GitHub's "Re-request review" button also sends);
-  - a comment says **`@BOT_USERNAME review`** (also `re-review`, `recheck`, optionally after "please" / "can you"). The bot reacts 👀 and reviews the current head.
-
-  **Pushing new commits never triggers a review**, and neither do title, label or description edits or a reopen. GitLab has no reliable webhook for its own "re-request review" button, so on GitLab use the comment command or remove and re-add the bot as reviewer. `BOT_USERNAME` must be the token account's username for reviewer requests to match.
-- **Requested re-reviews** (reviewer request, comment command, dashboard button) skip the "already reviewed this head" memory, and the prompt carries the bot's still-open findings. The model drops fixed ones, keeps real ones at their current line, and doesn't raise new complaints about unchanged code it already accepted. Fixed findings' threads are then resolved. If the re-review requests changes, the bot withdraws its earlier approval (GitLab `unapprove`, GitHub dismisses its approving review). Requests on a draft are held until it is marked ready. Both platforms get inline comments on lines that exist in the diff (GitLab as discussions, GitHub as a batched review) plus a summary; `MAX_INLINE` caps them per review (default 20).
-- **Live dashboard.** `/dashboard` streams over Server-Sent Events (`/api/events`), so the page updates on every stage change instead of polling every 2s. History is paged in the browser (25/page); `/api/reviews` still returns the whole snapshot for scripts.
-- **Resolved threads are respected.** After a re-review the bot closes its own inline discussions whose finding is gone from the new review — only bot-authored threads, only still-unresolved ones, and never a thread a human has replied in (that one is theirs to close). One already resolved is left untouched.
-- Only **open, non-draft** merge requests and pull requests are reviewed. A draft is skipped when opened and reviewed when it is marked ready (GitLab `update` with `draft` false, GitHub `ready_for_review`). Closed and merged MRs/PRs are ignored, never recorded.
-- Auto-approve: verdict `APPROVE` and the token user may approve. GitLab additionally requires access ≥ `APPROVE_ACCESS_LEVEL` and checks `user_can_approve`; GitHub requires push permission on the repo.
-- A review whose head commit moved while the model was thinking is discarded, so a stale verdict never lands on newer code.
-- A target whose head SHA was already reviewed is skipped. This is what stops the approve -> update event -> approve loop: our own approval fires a fresh MR event with identical code. The memory is in-process (cleared on restart).
-- **Replies: decide, then defend or concede.** Cheap rules run first, with no model call: the comment @mentions the bot or is a reply in a thread the bot opened, it isn't the bot's own, the author isn't a bot, plus access level and cooldown. One model call then picks a stance and writes the reply. `NO_REPLY` (thanks, "fixed", off-topic) posts nothing. `ANSWER` explains. `DEFEND` restates the point once with evidence. `CONCEDE` ("You're right — …") resolves the bot's thread and records the finding in `MEMORY_DB` as a mistake. Up to `LESSONS_IN_PROMPT` recent mistakes for the same repo go into every later review prompt, so the same false positive is not raised again. `make mistakes` lists them.
-- Debate: a GitLab note or GitHub comment that `@BOT_USERNAME` gets an in-thread answer — and inside a thread the bot opened, the reply alone is enough, no mention needed. Our own replies are never answered.
-- **A comment is judged before anything is recorded.** `comment_decision()` answers "does this owe a reply, and why not" in one place — wrong note type, our own reply, bot author, missing author, no mention outside our own thread — and a comment that fails creates no dashboard row at all. Only answered comments are recorded, so the history stays reviews and real conversations instead of every echo of the bot's own output. Per-note dedupe, per-thread cooldown (`COOLDOWN_SECONDS`), a bounded transcript of that discussion, and the diff under discussion (up to 20,000 characters); GitLab additionally requires `MIN_ACCESS_LEVEL`. Bot and `[bot]` authors are ignored. Blank `BOT_USERNAME` disables it.
-- A dropped connection (`Connection reset by peer`) during a platform API call is retried up to `API_ATTEMPTS` times with a short backoff instead of failing the review. HTTP errors (401/404) are not retried.
-- Diffs larger than `MAX_DIFF` (default 30,000 characters) are reviewed in chunks — several model calls over file and hunk boundaries, merged with the strictest verdict — instead of being rejected or truncated. All calls share the `REVIEW_BUDGET_S` budget; chunks it does not reach are skipped and labelled as a partial review. API and Hermes errors are logged; retries and persistence are not guaranteed after acknowledgement.
-
-Review input is untrusted. The service requests empty Hermes toolsets and strips platform credentials from the CLI child environment, but use a dedicated least-privilege account and review model output before acting on it.
-
-## Tests
-
-```bash
-python3 -m unittest discover -s tests -v   # 38 tests: units, end-to-end, concurrency races
+make test                                                    # full unit and end-to-end suite
+python3 -m unittest tests.test_server.ReviewRequestTests -v  # one class
 python3 tests/loadtest.py --requests 200 --concurrency 32 --workers 4
 ```
 
-Tests use mocks and do not prove platform credentials, network access or model readiness.
-
-## Operating it
-
-`make` lists every target. The ones you will actually use on the box:
-
-```
-make restart     # after editing .env or pulling code
-make health      # 200 check against the MagicDNS name
-make dash        # dashboard URL + where the password lives
-make log         # last 100 lines of server.log
-make logs        # stream server.log
-make password NEW=secret   # rewrite DASHBOARD_PASSWORD and restart
-make skill       # install SKILL.md (the review rubric) into the service's Hermes home
-make mistakes    # findings the bot conceded were wrong, newest first (N=20)
-make deploy      # git pull origin/master, install the skill, restart, health check
-```
-
-`SKILL.md` is the reviewer's rubric and output contract, loaded into every model call via
-`HERMES_SKILL`. Edit it here and run `make skill`; don't edit the installed copy, or the next
-deploy overwrites it.
-
-`make` resolves the host from `tailscale status` (MagicDNS name), so the printed URL keeps working when the tailnet IP changes.
-
-## Dashboard and access
-
-`GET /dashboard` shows live reviews (stage, elapsed, progress), totals, average and p95 duration, verdict counts, conceded mistakes and history. `GET /api/reviews` is the same data as JSON.
-
-Row actions (each needs the dashboard login; the page sends an `X-Dashboard` header and the server refuses cross-site requests):
-
-- **Stop** (running row): kills the model call and every process it started, and marks the row `stopped`. A stop that arrives between steps takes effect before the next step, so nothing is posted after it.
-- **Re-review** (history row): queues a fresh review of that MR/PR, rebuilt from the row's URL. It skips the "already reviewed" and same-head guards, and carries the bot's open findings like any requested re-review. A merged or closed MR is refused.
-- **Delete** (history row): removes the record from the page and from `REVIEW_STORE`. A running review must be stopped first.
-
-The same actions are plain HTTP for scripts: `POST /api/reviews/<id>/stop|rereview|delete` with `X-Dashboard: 1`.
-
-With `DASHBOARD_PASSWORD` blank, anyone who can reach the port can use these actions, so keep it blank only behind Tailscale or an access proxy.
-
-Access is HTTP Basic when `DASHBOARD_PASSWORD` is set — the browser's own login prompt, no token in the URL, nothing to leak in bookmarks or referrers. Blank password leaves it open, which is only acceptable when a proxy does the gating.
-
-Three ways to expose it, pick one:
-
-- **Tailscale (simplest).** Bind to the tailnet and skip app auth: `BIND_HOST=<tailscale-ip>`. Only devices on the tailnet can reach the port.
-- **Cloudflare Zero Trust.** Point an Access application at the dashboard hostname, add an allow policy for your email/IdP, then leave `DASHBOARD_PASSWORD` blank — Access authenticates before the request reaches the server. Keep the webhook path (`/gl-review`, `/gh-review`) outside the Access policy or use a service token, otherwise webhooks get redirected to a login page.
-- **Plain LAN + Basic auth.** Set `DASHBOARD_PASSWORD` and accept that Basic credentials are only as private as the network.
-
-Never put the dashboard behind a path that also serves webhooks without checking that policy bypass — a 302 to a login page reads as a delivery failure on GitLab.
-
-## Concurrency and limits
-
-- Reviews run in a fixed worker pool (`MAX_WORKERS`); webhooks queue up to `QUEUE_SIZE` then get `503` so the platform retries. Ack is immediate (`202`) — a full queue is the only throttle.
-- Two events for the same MR/PR are serialized by a per-target lock, so an older diff cannot post its review after a newer one.
-- Duplicate payloads are claimed under a lock before dispatch: 16 parallel copies of one delivery produce exactly one review.
-- A failed review releases its claim, so the platform's retry is not swallowed by dedupe.
-- Accept backlog is 128 (stdlib default 5 drops connections under a burst).
-
-Measured on an ARM SBC (4×A55, Python 3.13, stub review of 50 ms): ~43 webhook req/s ack throughput, p50 37 ms at concurrency 1; `/health` ceiling ~170 req/s. Real throughput is bounded by `MAX_WORKERS / review_latency`, not by the HTTP layer — a 20 s model review with 4 workers means ~0.2 reviews/s.
-
-`tests/loadtest.py` verifies the pool never exceeds `MAX_WORKERS` and reports statuses, throughput and latency percentiles.
+The tests use a fake GitLab and a stub `hermes`. They don't prove that your tokens, network or model work; `make init` and `make health` do that.

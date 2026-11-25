@@ -111,11 +111,20 @@
   .tip .row { display:flex; justify-content:space-between; gap:14px; color:var(--ink-2); }
 
   /* Tables */
-  .tbl { overflow:auto; }
-  table { width:100%; border-collapse:separate; border-spacing:0; font-size:12.5px; }
-  thead th { position:sticky; top:0; z-index:1; background:var(--surface); color:var(--ink-3); font-weight:500;
-             font-size:12px; text-align:left; padding:10px 10px 8px; border-bottom:1px solid var(--line); white-space:nowrap; }
-  tbody td { padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:middle; }
+  /* Fixed layout: the table always fits its card. Fixed-width columns hold badges,
+     numbers and buttons; the text columns share what is left and truncate. */
+  table { width:100%; table-layout:fixed; border-collapse:separate; border-spacing:0; font-size:12.5px; }
+  thead th { background:var(--surface); color:var(--ink-3); font-weight:500; font-size:12px; text-align:left;
+             padding:10px 10px 8px; border-bottom:1px solid var(--line); white-space:nowrap;
+             overflow:hidden; text-overflow:ellipsis; }
+  tbody td { padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:middle; overflow:hidden; }
+  .trunc { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+  .sub { display:block; margin-top:1px; color:var(--ink-3); font-size:11.5px;
+         overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .sm-only { display:none; }
+  .w-when { width:80px; } .w-verdict { width:160px; } .w-inline { width:62px; } .w-dur { width:86px; }
+  .w-status { width:104px; } .w-acts { width:84px; } .w-stage { width:230px; } .w-elapsed { width:90px; }
+  .w-remark { width:28%; }
   tbody tr:last-child td { border-bottom:0; }
   tbody tr.row { cursor:pointer; }
   tbody tr.row:hover, tbody tr.row.open { background:var(--surface-2); }
@@ -123,8 +132,8 @@
   .nowrap { white-space:nowrap; }
   .empty { color:var(--ink-3); padding:22px 12px !important; text-align:center; cursor:default; }
   .mono { font-family:var(--mono); font-size:12px; }
-  a { color:inherit; text-decoration:none; border-bottom:1px solid var(--line-2); }
-  a:hover { border-bottom-color:var(--ink-2); }
+  a { color:inherit; text-decoration:underline; text-decoration-color:var(--line-2); text-underline-offset:3px; }
+  a:hover { text-decoration-color:var(--ink-2); }
   .dim { color:var(--ink-2); } .faint { color:var(--ink-3); }
 
   .badge { display:inline-flex; align-items:center; gap:5px; padding:1px 7px 1px 6px; border-radius:999px;
@@ -136,7 +145,7 @@
   .b-mute { color:var(--ink-2); background:var(--surface-2); }
   .b-live { color:var(--accent); background:var(--accent-wash); }
 
-  .remark { display:block; color:var(--ink-2); max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .remark { color:var(--ink-2); }
   .remark.bad { color:var(--bad); }
   .detail td { background:var(--surface-2); padding:10px 12px 14px; cursor:default; }
   .detail dl { display:grid; grid-template-columns:max-content 1fr; gap:4px 16px; margin:0; font-size:12.5px; }
@@ -156,11 +165,52 @@
 
   /* Row actions: visible, quiet; destructive ones turn red on hover only */
   td.acts { white-space:nowrap; text-align:right; }
-  .act { padding:3px 9px; margin-left:4px; cursor:pointer; font-size:12px; color:var(--ink-2);
-         background:var(--surface); border:1px solid var(--line); border-radius:5px; }
+  th.acts { text-align:right; }
+  .act { display:inline-grid; place-items:center; width:28px; height:28px; padding:0; margin-left:4px; cursor:pointer;
+         color:var(--ink-2); background:var(--surface); border:1px solid var(--line); border-radius:6px; vertical-align:middle; }
+  .act svg { width:14px; height:14px; }
+  .act, .btn, .back, .pager button, .seg button, .iconbtn { transition:transform .12s ease, background-color .12s, border-color .12s, color .12s; }
+  .act:hover:not(:disabled), .btn:hover:not(:disabled), .iconbtn:hover, .pager button:hover:not(:disabled) { transform:translateY(-1px); }
+  .act:active:not(:disabled), .btn:active:not(:disabled), .iconbtn:active, .pager button:active:not(:disabled), .back:active { transform:translateY(0) scale(.97); }
   .act:hover:not(:disabled) { color:var(--ink); border-color:var(--line-2); }
   .act.danger:hover:not(:disabled) { color:var(--bad); border-color:var(--bad); }
   .act:disabled { opacity:.4; cursor:default; }
+
+  .chev { color:var(--ink-3); display:inline-grid; place-items:center; width:20px; vertical-align:middle; margin-left:2px; }
+  .chev svg { width:14px; height:14px; transition:transform .12s; }
+  tr.row:hover .chev svg { transform:translateX(2px); color:var(--ink); }
+  .count { color:var(--ink-3); font-size:11.5px; }
+  .w-runs { width:70px; } .w-acts-sm { width:64px; }
+
+  /* Detail view: one MR/PR, every event */
+  .back { display:inline-flex; align-items:center; gap:6px; margin:16px 0 12px -9px; padding:6px 10px 6px 8px; cursor:pointer;
+          background:transparent; border:1px solid transparent; border-radius:6px; color:var(--ink-2); }
+  .back:hover { color:var(--ink); background:var(--surface); border-color:var(--line); }
+  .back svg { width:14px; height:14px; }
+  .back + section { margin-top:0; }
+  .ev .line { display:none; }
+  .linkbtn { background:none; border:0; padding:0; cursor:pointer; color:var(--accent); font-size:12px; }
+  .linkbtn:hover { text-decoration:underline; }
+  .dhead { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; padding:16px; flex-wrap:wrap; }
+  .dhead h2 { font:600 18px/1.3 var(--mono); margin:0; letter-spacing:-.01em; overflow-wrap:anywhere; }
+  .dhead h2 a { text-decoration-color:var(--line-2); }
+  .dhead .meta { color:var(--ink-3); font-size:12.5px; margin-top:4px; }
+  .dhead .meta b { color:var(--ink-2); font-weight:500; }
+  .btn { display:inline-flex; align-items:center; gap:6px; height:34px; padding:0 14px; cursor:pointer; font-weight:600;
+         background:var(--ink); color:var(--surface); border:1px solid var(--ink); border-radius:6px; white-space:nowrap; }
+  .btn svg { width:14px; height:14px; }
+  .btn:disabled { opacity:.4; cursor:default; }
+  .dstats { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); border-top:1px solid var(--line); }
+  .dstats .tile { border-right:1px solid var(--line); background:transparent; }
+  .dstats .tile:last-child { border-right:0; }
+  .dstats .v .badge { font-size:12.5px; vertical-align:middle; }
+  .ev td { vertical-align:top; padding-top:10px; padding-bottom:10px; }
+  .ev .full { white-space:pre-wrap; overflow-wrap:anywhere; color:var(--ink-2); }
+  .ev .full.bad { color:var(--bad); }
+  .ev .when b { display:block; font-weight:500; color:var(--ink); }
+  .ev .when span { color:var(--ink-3); font-size:11.5px; }
+  .ev .facts { display:block; color:var(--ink-3); font-size:11.5px; margin-top:3px; }
+  .w-ev-when { width:150px; } .w-ev-status { width:104px; } .w-ev-verdict { width:160px; } .w-ev-act { width:52px; }
 
   .foot { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:10px 14px;
           border-top:1px solid var(--line); color:var(--ink-3); font-size:12px; }
@@ -181,9 +231,30 @@
     .filters input { width:100%; }
     .filters .grow { display:none; }
   }
-  @media (max-width:560px) {
+  @media (max-width:1024px) {
+    .c-md { display:none; }   /* Inline and Remark move to the expanded row */
+  }
+  @media (max-width:640px) {
     body { padding:14px 16px 40px; }
-    .hide-sm { display:none; }
+    .dstats { grid-template-columns:repeat(2,minmax(0,1fr)); }
+    .dstats .tile:nth-child(2) { border-right:0; }
+    .dstats .tile:nth-child(-n+2) { border-bottom:1px solid var(--line); }
+    .ev .c-ev { display:none; }
+    .ev .line { display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin-bottom:4px; }
+    .ev .line b { font-weight:500; }
+    .ev td .badge { padding:1px 7px 1px 6px; }
+    .ev td .badge .w { position:static; width:auto; height:auto; overflow:visible; clip:auto; }
+    .act { width:44px; height:44px; } .w-acts, .w-ev-act { width:66px; } .w-acts-sm { width:66px; }
+    .btn { height:44px; width:100%; justify-content:center; }
+    .dhead > div { width:100%; }
+    .hide-sm, .c-sm { display:none; }
+    .sm-only { display:inline; }
+    .w-verdict, .w-status { width:52px; }
+    .w-stage { width:96px; } .w-elapsed { width:70px; }
+    .stage { display:none; }
+    /* Badges keep icon + color; the word stays for screen readers and in the row details */
+    td .badge { padding:3px; }
+    td .badge .w { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; }
   }
 </style>
 </head>
@@ -202,6 +273,7 @@
     </div>
   </header>
 
+  <div id="overview">
   <div class="filters" role="group" aria-label="Filters">
     <div class="seg" id="range" role="group" aria-label="Time range">
       <button type="button" data-r="1">Today</button>
@@ -257,30 +329,36 @@
     <div class="tbl">
       <table>
         <thead><tr>
-          <th scope="col">Target</th><th scope="col" class="hide-sm">Author</th>
-          <th scope="col">Stage</th><th scope="col" class="num">Elapsed</th>
-          <th scope="col"><span class="sr">Actions</span></th>
+          <th scope="col">Target</th><th scope="col" class="w-stage">Stage</th>
+          <th scope="col" class="num w-elapsed">Elapsed</th>
+          <th scope="col" class="acts w-acts"><span class="sr">Actions</span></th>
         </tr></thead>
-        <tbody id="live"><tr><td colspan="5" class="empty">Idle — waiting for a webhook</td></tr></tbody>
+        <tbody id="live"><tr><td colspan="4" class="empty">Idle — waiting for a webhook</td></tr></tbody>
       </table>
     </div>
   </section>
 
   <section class="card">
-    <div class="cardhead"><h2>History</h2><span class="note" id="hist-note"></span></div>
+    <div class="cardhead"><h2>Merge requests</h2><span class="note" id="hist-note"></span></div>
     <div class="tbl">
       <table>
         <thead><tr>
-          <th scope="col" class="nowrap">When</th><th scope="col">Target</th><th scope="col" class="hide-sm">Author</th>
-          <th scope="col">Verdict</th><th scope="col" class="num hide-sm">Inline</th>
-          <th scope="col" class="num">Duration</th><th scope="col">Status</th><th scope="col" class="hide-sm">Remark</th>
-          <th scope="col"><span class="sr">Actions</span></th>
+          <th scope="col">Merge request</th>
+          <th scope="col" class="w-when c-sm">Updated</th>
+          <th scope="col" class="w-verdict">Latest verdict</th>
+          <th scope="col" class="num w-runs c-md">Runs</th>
+          <th scope="col" class="w-status">Last run</th>
+          <th scope="col" class="w-remark c-md">Note</th>
+          <th scope="col" class="acts w-acts"><span class="sr">Actions</span></th>
         </tr></thead>
-        <tbody id="hist"><tr><td colspan="9" class="empty">No reviews yet</td></tr></tbody>
+        <tbody id="hist"><tr><td colspan="7" class="empty">No reviews yet</td></tr></tbody>
       </table>
     </div>
     <div class="foot"><span id="hist-count"></span><div class="pager" id="pager"></div></div>
   </section>
+  </div>
+
+  <div id="detail" hidden></div>
 </div>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
@@ -325,7 +403,17 @@ const STATUS = {
   skipped: ["b-mute", "dash", "Skipped"], running: ["b-live", "dot", "Running"],
 };
 const VERDICT = { APPROVE: ["b-good", "check", "Approved"], REQUEST_CHANGES: ["b-bad", "cross", "Changes requested"] };
-const badge = ([cls, icon, word]) => `<span class="badge ${cls}">${ICON[icon]}${esc(word)}</span>`;
+const badge = ([cls, icon, word]) => `<span class="badge ${cls}" title="${esc(word)}">${ICON[icon]}<span class="w">${esc(word)}</span></span>`;
+const BTN = {
+  rereview: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>',
+  delete: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg>',
+  stop: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/></svg>',
+};
+const NAME = {rereview: "Re-review", delete: "Delete record", stop: "Stop review"};
+const actBtn = (act, rec, extra = "") => `<button type="button" class="act${act === "rereview" ? "" : " danger"}" data-act="${act}"
+  data-id="${rec.id}" data-label="${esc(rec.target)}" aria-label="${NAME[act]} ${esc(rec.target)}" title="${NAME[act]}" ${extra}>${BTN[act]}</button>`;
+const targetCell = (rec, more = "") => `<td><span class="trunc mono">${link(rec.target, rec.url)}</span>
+  <span class="sub">${esc(rec.author) || "–"}${more}</span></td>`;
 const statusBadge = s => badge(STATUS[s] || ["b-mute", "dash", s || "—"]);
 const verdictBadge = v => v ? badge(VERDICT[v] || ["b-mute", "dash", v]) : '<span class="faint">–</span>';
 
@@ -333,7 +421,7 @@ const verdictBadge = v => v ? badge(VERDICT[v] || ["b-mute", "dash", v]) : '<spa
 const PAGE = 25;
 const state = {
   range: store.get("range", 7), status: store.get("status", "!skipped"), q: "",
-  page: 0, open: null, last: null,
+  page: 0, last: null,
 };
 
 // ---- theme --------------------------------------------------------------------
@@ -477,57 +565,136 @@ function renderLive(live) {
   $("live").innerHTML = live.length ? live.map(j => {
     const at = Math.max(0, STAGES.indexOf(j.stage));
     const steps = STAGES.map((s, i) => `<i class="${i < at ? "done" : i === at ? "cur" : ""}"></i>`).join("");
-    return `<tr><td class="mono">${link(j.target, j.url)}</td><td class="dim hide-sm">${esc(j.author) || "–"}</td>
-      <td class="nowrap"><span class="steps" role="img" aria-label="Stage ${at + 1} of 4: ${esc(j.stage)}">${steps}</span><span class="stage">${esc(j.stage)}</span></td>
+    return `<tr>${targetCell(j)}
+      <td class="nowrap"><span class="steps" role="img" aria-label="Stage ${at + 1} of 4: ${esc(j.stage)}" title="${esc(j.stage)}">${steps}</span><span class="stage">${esc(j.stage)}</span></td>
       <td class="num">${secs(j.elapsed)}</td>
-      <td class="acts"><button class="act danger" data-act="stop" data-id="${j.id}" data-label="${esc(j.target)}">Stop</button></td></tr>`;
-  }).join("") : '<tr><td colspan="5" class="empty">Idle — waiting for a webhook</td></tr>';
+      <td class="acts">${actBtn("stop", j)}</td></tr>`;
+  }).join("") : '<tr><td colspan="4" class="empty">Idle — waiting for a webhook</td></tr>';
 }
 
-// ---- history ------------------------------------------------------------------
+// ---- merge requests: one row per MR/PR, newest activity first ---------------------
+const keyOf = r => r.url || `${r.platform}:${r.target}`;
+function groupOf(rows) {
+  const map = new Map();
+  for (const r of rows) {  // history arrives newest first
+    const k = keyOf(r);
+    if (!map.has(k)) map.set(k, {key: k, events: []});
+    map.get(k).events.push(r);
+  }
+  return [...map.values()].map(g => {
+    const latest = g.events[0], reviewed = g.events.filter(e => e.verdict);
+    return Object.assign(g, {latest, review: reviewed[0], reviews: reviewed.length,
+      target: latest.target, url: g.events.find(e => e.url)?.url || "", author: g.events.find(e => e.author)?.author || ""});
+  });
+}
+const CHEV = '<span class="chev" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg></span>';
+
 function renderHistory(rows) {
-  const pages = Math.max(1, Math.ceil(rows.length / PAGE));
+  const groups = groupOf(rows);
+  const pages = Math.max(1, Math.ceil(groups.length / PAGE));
   if (state.page >= pages) state.page = pages - 1;
-  const from = state.page * PAGE, slice = rows.slice(from, from + PAGE);
-  $("hist-note").textContent = state.status || state.q ? "filtered" : "";
-  $("hist-count").textContent = rows.length ? `${from + 1}–${from + slice.length} of ${fmtInt(rows.length)}` : "";
-  $("pager").innerHTML = rows.length > PAGE
+  const from = state.page * PAGE, slice = groups.slice(from, from + PAGE);
+  $("hist-note").textContent = groups.length ? `${fmtInt(groups.length)} merge requests · ${fmtInt(rows.length)} runs` : "";
+  $("hist-count").textContent = groups.length ? `${from + 1}–${from + slice.length} of ${fmtInt(groups.length)}` : "";
+  $("pager").innerHTML = groups.length > PAGE
     ? `<button type="button" data-p="-1" ${state.page ? "" : "disabled"}>Previous</button>
        <button type="button" data-p="1" ${state.page < pages - 1 ? "" : "disabled"}>Next</button>` : "";
-  $("hist").innerHTML = slice.length ? slice.map(h => {
-    const why = h.error || h.remark || "";
-    const open = state.open === h.id;
-    let html = `<tr class="row${open ? " open" : ""}" data-row="${h.id}" tabindex="0" aria-expanded="${open}">
-      <td class="nowrap faint" title="${esc(stamp(h.started))}">${esc(ago(h.started))}</td>
-      <td class="mono">${link(h.target, h.url)}</td><td class="dim hide-sm">${esc(h.author) || "–"}</td>
-      <td>${verdictBadge(h.verdict)}</td><td class="num hide-sm">${h.inline || 0}</td>
-      <td class="num dim">${secs(h.duration)}</td><td>${statusBadge(h.status)}</td>
-      <td class="hide-sm"><span class="remark ${h.error ? "bad" : ""}" title="${esc(why)}">${esc(why)}</span></td>
-      <td class="acts">
-        <button class="act" data-act="rereview" data-id="${h.id}" data-label="${esc(h.target)}" ${h.url ? "" : "disabled"}>Re-review</button>
-        <button class="act danger" data-act="delete" data-id="${h.id}" data-label="${esc(h.target)}">Delete</button></td></tr>`;
-    if (open) {
-      const item = (k, v) => v || v === 0 ? `<dt>${k}</dt><dd>${v}</dd>` : "";
-      html += `<tr class="detail"><td colspan="9"><dl>
-        ${item("Started", esc(stamp(h.started)))}${item("Platform", esc(h.platform))}
-        ${item("Target", link(h.target, h.url))}${item("Author", esc(h.author))}
-        ${item("Files", h.files)}${item("Inline comments", h.inline)}${item("Duration", secs(h.duration))}
-        ${h.error ? item("Error", `<span style="color:var(--bad)">${esc(h.error)}</span>`) : ""}
-        ${item("Remark", esc(h.remark))}</dl></td></tr>`;
-    }
-    return html;
-  }).join("") : `<tr><td colspan="9" class="empty">${state.status || state.q ? "Nothing matches these filters" : "No reviews in this range"}</td></tr>`;
+  $("hist").innerHTML = slice.length ? slice.map(g => {
+    const l = g.latest, why = l.error || l.remark || "";
+    const rec = {id: (g.events.find(e => e.url) || l).id, target: g.target};
+    return `<tr class="row" data-key="${esc(g.key)}" tabindex="0" aria-label="Open ${esc(g.target)}">
+      ${targetCell(g, `<span class="sm-only"> · ${esc(ago(l.started))}</span>`)}
+      <td class="nowrap faint c-sm" title="${esc(stamp(l.started))}">${esc(ago(l.started))}</td>
+      <td>${verdictBadge(g.review?.verdict)}</td>
+      <td class="num c-md">${g.events.length}</td>
+      <td>${statusBadge(l.status)}</td>
+      <td class="c-md"><span class="trunc remark ${l.error ? "bad" : ""}" title="${esc(why)}">${esc(why) || '<span class="faint">–</span>'}</span></td>
+      <td class="acts">${actBtn("rereview", rec, g.url ? "" : "disabled")}${CHEV}</td></tr>`;
+  }).join("") : `<tr><td colspan="7" class="empty">${state.status || state.q ? "Nothing matches these filters" : "No reviews in this range"}</td></tr>`;
 }
+
+// ---- detail view: #mr=<key> ------------------------------------------------------
+const route = () => { const m = location.hash.match(/^#mr=(.+)$/); return m ? decodeURIComponent(m[1]) : null; };
+let fromList = false;  // back returns to the list's scroll position only when we came from it
+const openMr = key => { fromList = true; listScroll = window.scrollY; location.hash = "mr=" + encodeURIComponent(key); };
+const BACK = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg>';
+let showSkipped = false;
+function renderDetail(d, key) {
+  const g = groupOf((d.history || []).filter(r => keyOf(r) === key))[0];
+  const live = (d.live || []).filter(j => keyOf(j) === key);
+  const back = `<button type="button" class="back" data-back>${BACK}All merge requests</button>`;
+  if (!g) {
+    $("detail").innerHTML = back + `<section class="card"><div class="empty" style="padding:40px">No records for this merge request.</div></section>`;
+    return;
+  }
+  const done = g.events.filter(e => e.status === "done" && e.duration);
+  const avg = done.length ? done.reduce((a, e) => a + e.duration, 0) / done.length : 0;
+  const first = g.events[g.events.length - 1].started;
+  const rec = {id: (g.events.find(e => e.url) || g.latest).id, target: g.target};
+  const skipped = g.events.filter(e => e.status === "skipped").length;
+  const shown = showSkipped ? g.events : g.events.filter(e => e.status !== "skipped");
+  document.title = `${g.target} · AI Code Reviewer`;
+  $("detail").innerHTML = back + `
+    <section class="card">
+      <div class="dhead">
+        <div>
+          <h2>${link(g.target, g.url)}</h2>
+          <div class="meta"><b>${esc(g.author) || "unknown author"}</b> · ${esc(g.latest.platform === "github" ? "GitHub" : "GitLab")}
+            · first seen ${esc(ago(first))} · last activity ${esc(ago(g.latest.started))}</div>
+        </div>
+        <div><button type="button" class="btn act-text" data-act="rereview" data-id="${rec.id}" data-label="${esc(g.target)}" ${g.url ? "" : "disabled"}>${BTN.rereview}Re-review this MR</button></div>
+      </div>
+      <div class="dstats">
+        <div class="tile"><div class="k">Latest verdict</div><div class="v">${verdictBadge(g.review?.verdict)}</div><div class="s">${g.review ? esc(ago(g.review.started)) : "no verdict yet"}</div></div>
+        <div class="tile"><div class="k">Reviews</div><div class="v num">${fmtInt(g.reviews)}</div><div class="s">${fmtInt(g.events.length)} runs in total</div></div>
+        <div class="tile"><div class="k">Inline comments</div><div class="v num">${fmtInt(g.events.reduce((a, e) => a + (+e.inline || 0), 0))}</div><div class="s">across all reviews</div></div>
+        <div class="tile"><div class="k">Avg review time</div><div class="v">${avg ? secs(avg) : "–"}</div><div class="s">${live.length ? "a review is running now" : "completed runs"}</div></div>
+      </div>
+    </section>
+    <section class="card">
+      <div class="cardhead"><h2>Timeline</h2><span class="note">${skipped ? `<button type="button" class="linkbtn" data-skipped>${showSkipped ? "Hide" : "Show"} ${fmtInt(skipped)} skipped</button> · ` : ""}${fmtInt(shown.length)} runs, newest first</span></div>
+      <div class="tbl"><table class="ev">
+        <thead><tr><th scope="col" class="w-ev-when c-ev">When</th><th scope="col" class="w-ev-status c-ev">Run</th>
+          <th scope="col" class="w-ev-verdict c-ev">Verdict</th><th scope="col">What happened</th>
+          <th scope="col" class="acts w-ev-act"><span class="sr">Actions</span></th></tr></thead>
+        <tbody>${shown.length ? "" : '<tr><td colspan="5" class="empty">Only skipped runs. Nothing was reviewed yet.</td></tr>'}${shown.map(e => {
+          const why = e.error || e.remark || "";
+          const facts = [e.files ? `${e.files} files` : "", e.inline ? `${e.inline} inline comments` : "", e.duration ? secs(e.duration) : ""].filter(Boolean).join(" · ");
+          return `<tr><td class="when c-ev"><b>${esc(ago(e.started))}</b><span>${esc(stamp(e.started))}</span></td>
+            <td class="c-ev">${statusBadge(e.status)}</td><td class="c-ev">${verdictBadge(e.verdict)}</td>
+            <td><span class="line"><b title="${esc(stamp(e.started))}">${esc(ago(e.started))}</b>${statusBadge(e.status)}${e.verdict ? verdictBadge(e.verdict) : ""}</span><span class="full ${e.error ? "bad" : ""}">${esc(why) || (e.verdict ? "Review posted" : "–")}</span>${facts ? `<span class="facts">${esc(facts)}</span>` : ""}</td>
+            <td class="acts">${actBtn("delete", {id: e.id, target: `${g.target} (${ago(e.started)})`})}</td></tr>`;
+        }).join("")}</tbody></table></div>
+    </section>`;
+}
+
+function show() {
+  const key = route();
+  $("overview").hidden = !!key;
+  $("detail").hidden = !key;
+  if (!key) document.title = "AI Code Reviewer";
+}
+let listScroll = 0;
+window.addEventListener("hashchange", () => {
+  const key = route();
+  if (key) listScroll = listScroll || window.scrollY; else fromList = false;
+  show(); rerender();
+  window.scrollTo(0, key ? 0 : listScroll);
+  if (!key) listScroll = 0;
+});
 
 function render(d) {
   state.last = d;
   const now = Date.now() / 1000;
   $("conn").classList.remove("stale");
   $("conn-text").textContent = "live";
+  show();
+  const key = route();
+  if (key) return renderDetail(d, key);
   const all = d.history || [];
   const ranged = all.filter(r => inRange(r, now));
   const rows = ranged.filter(matches);
-  $("scope").textContent = state.status || state.q ? `${fmtInt(rows.length)} of ${fmtInt(ranged.length)} match` : "";
+  $("scope").textContent = state.status || state.q ? `${fmtInt(rows.length)} of ${fmtInt(ranged.length)} runs match` : "";
   renderKpis(d, rows, now, ranged);
   const series = daily(all.filter(matches), now);
   renderChart(series); renderSpark(series);
@@ -547,7 +714,9 @@ const CONFIRM = {
 document.addEventListener("click", async e => {
   const pg = e.target.closest("#pager button");
   if (pg) { state.page = Math.max(0, state.page + Number(pg.dataset.p)); return rerender(); }
-  const b = e.target.closest("button.act");
+  if (e.target.closest("[data-skipped]")) { showSkipped = !showSkipped; return rerender(); }
+  if (e.target.closest("[data-back]")) { fromList ? history.back() : history.replaceState(null, "", location.pathname + location.search); fromList || (show(), rerender()); return; }
+  const b = e.target.closest("button.act, button.act-text");
   if (b) {
     if (b.disabled) return;
     const {act, id, label} = b.dataset;
@@ -564,7 +733,7 @@ document.addEventListener("click", async e => {
   }
   if (e.target.closest("a")) return;  // links open the MR, not the row
   const tr = e.target.closest("tr.row");
-  if (tr) { const id = +tr.dataset.row; state.open = state.open === id ? null : id; rerender(); }
+  if (tr) openMr(tr.dataset.key);
 });
 document.addEventListener("keydown", e => {
   const tr = e.target.closest && e.target.closest("tr.row");
