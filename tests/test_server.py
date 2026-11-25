@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Tests must never write to a real review store: the deployed service exports
 # REVIEW_STORE, and inheriting it makes the suite append fixture rows to it.
 os.environ["REVIEW_STORE"] = ""
+os.environ["MEMORY_DB"] = ""  # same for the mistakes database
 import server  # noqa: E402
 
 # Ambient env must not change results: these three are module-level constants.
@@ -528,9 +529,9 @@ class TriggerFilterTests(unittest.TestCase):
         self.assertTrue(server.triggers_review("gitlab", "Note Hook", payload))
 
     def test_github_pr_actions(self):
-        self.assertTrue(server.triggers_review("github", "pull_request", {"action": "opened"}))
-        self.assertTrue(server.triggers_review("github", "pull_request", {"action": "ready_for_review"}))
-        for action in ("synchronize", "reopened", "closed", "edited"):
+        for action in ("opened", "ready_for_review", "synchronize"):
+            self.assertTrue(server.triggers_review("github", "pull_request", {"action": action}))
+        for action in ("reopened", "closed", "edited", "converted_to_draft"):
             self.assertFalse(server.triggers_review("github", "pull_request", {"action": action}), action)
         self.assertFalse(server.triggers_review("github", "push", {"action": "opened"}))
 
@@ -965,7 +966,7 @@ class DebateRemarkTests(unittest.TestCase):
         finally:
             server.BOT_USERNAME = old
         self.assertTrue(posted)
-        self.assertNotIn("remark", seen)
+        self.assertEqual(seen.get("remark"), "answered")  # reached the reply, not a skip
 
     def test_no_mention_outside_our_thread_still_skips(self):
         """Someone else's discussion is not an address; the mention stays required."""
@@ -1137,9 +1138,9 @@ class ResolveThreadTests(unittest.TestCase):
     def resolve(self, discussions):
         calls = []
 
-        def fake_api_json(base, token, platform, path, body=None, accept="application/json"):
+        def fake_api_json(base, token, platform, path, body=None, accept="application/json", method=None):
             if body is not None:
-                calls.append((path, body))
+                calls.append((path, body, method))
                 return {}
             return discussions
 
@@ -1150,7 +1151,23 @@ class ResolveThreadTests(unittest.TestCase):
     def test_fixed_finding_is_resolved(self):
         closed, calls = self.resolve([self.discussion(line=5)])
         self.assertEqual(closed, 1)
-        self.assertEqual(calls, [("/projects/1/merge_requests/2/discussions/d1", {"resolved": "true"})])
+        # GitLab resolves only via PUT; the old POST was a 404 in production.
+        self.assertEqual(calls, [("/projects/1/merge_requests/2/discussions/d1?resolved=true", {}, "PUT")])
+
+    def test_resolve_really_sends_put(self):
+        """Below the api_json mock: the request method reaches urllib."""
+        seen = []
+
+        class Opener:
+            def open(self, request, timeout=None):
+                seen.append((request.get_method(), request.full_url))
+                raise server.URLError("stop")
+
+        with patch.object(server, "build_opener", return_value=Opener()), \
+                patch.object(server, "API_ATTEMPTS", 1):
+            with self.assertRaises(server.URLError):
+                server.gl_resolve("https://gl/api/v4", "t", 1, 2, "d1")
+        self.assertEqual(seen, [("PUT", "https://gl/api/v4/projects/1/merge_requests/2/discussions/d1?resolved=true")])
 
     def test_still_flagged_finding_stays_open(self):
         closed, calls = self.resolve([self.discussion(line=10)])
@@ -1180,7 +1197,7 @@ class ResolveThreadTests(unittest.TestCase):
         self.assertEqual((closed, calls), (0, []))
 
     def test_api_failure_does_not_abort_the_review(self):
-        def fake_api_json(base, token, platform, path, body=None, accept="application/json"):
+        def fake_api_json(base, token, platform, path, body=None, accept="application/json", method=None):
             if body is not None:
                 raise server.URLError("down")
             return [self.discussion(line=5)]
@@ -2310,6 +2327,327 @@ class ConcurrencyTests(unittest.TestCase):
             while time.time() < deadline and key in server._seen:
                 time.sleep(0.02)
             self.assertNotIn(key, server._seen, "failed review kept the dedupe claim")
+
+
+class PushReviewTests(unittest.TestCase):
+    """A push re-reviews; edits do not; a burst of pushes costs one review."""
+
+    def gl(self, **attrs):
+        base = {"action": "update", "state": "opened", "iid": 1, "title": "feat"}
+        base.update(attrs)
+        return {"object_kind": "merge_request", "project": {"id": 1}, "object_attributes": base}
+
+    def test_gitlab_push_triggers_but_edit_does_not(self):
+        self.assertTrue(server.triggers_review("gitlab", "Merge Request Hook", self.gl(oldrev="abc")))
+        self.assertTrue(server.is_rereview("gitlab", self.gl(oldrev="abc")))
+        self.assertFalse(server.triggers_review("gitlab", "Merge Request Hook", self.gl()))
+        self.assertFalse(server.is_rereview("gitlab", self.gl()))
+
+    def test_push_to_a_draft_creates_no_row(self):
+        self.assertFalse(server.triggers_review("gitlab", "Merge Request Hook",
+                                                self.gl(oldrev="abc", title="Draft: wip")))
+        self.assertFalse(server.triggers_review("gitlab", "Merge Request Hook", self.gl(oldrev="abc", draft=True)))
+        self.assertFalse(server.triggers_review("github", "pull_request",
+                                                {"action": "synchronize", "pull_request": {"draft": True}}))
+
+    def test_push_to_closed_mr_is_ignored(self):
+        self.assertFalse(server.triggers_review("gitlab", "Merge Request Hook",
+                                                self.gl(oldrev="abc", state="merged")))
+
+    def test_burst_of_pushes_enqueues_only_the_last(self):
+        fired = []
+        key = ("gitlab", 1, 1)
+        with patch.object(server, "enqueue", side_effect=fired.append):
+            for n in range(4):
+                self.assertTrue(server.debounce(("gitlab", "e", {"n": n}, {}, b"%d" % n, key), delay=0.05))
+            deadline = time.time() + 2
+            while not fired and time.time() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.1)
+        self.assertEqual([job[2]["n"] for job in fired], [3])
+        self.assertNotIn(key, server._debounced)
+
+    def test_debounce_off_or_untargeted_enqueues_now(self):
+        self.assertFalse(server.debounce(("gitlab", "e", {}, {}, b"x", ("gitlab", 1, 1)), delay=0))
+        self.assertFalse(server.debounce(("gitlab", "e", {}, {}, b"x", None), delay=5))
+
+    def test_handler_debounces_pushes(self):
+        raw = json.dumps(self.gl(oldrev="abc")).encode()
+        server._seen.clear()
+        with patch.object(server, "debounce", return_value=True) as debounce, \
+                patch.object(server, "enqueue") as enqueue:
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+            httpd.config = {"gitlab": {"token": "t", "secret": SECRET, "url": "https://gl"}}
+            threading.Thread(target=httpd.serve_forever, daemon=True).start()
+            try:
+                request = Request(f"http://127.0.0.1:{httpd.server_address[1]}/gl-review", data=raw,
+                                  headers={"X-Gitlab-Token": SECRET, "X-Gitlab-Event": "Merge Request Hook"})
+                with urlopen(request, timeout=5) as response:
+                    self.assertEqual(response.status, 202)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+        debounce.assert_called_once()
+        enqueue.assert_not_called()
+
+
+class PreexistingMRTests(unittest.TestCase):
+    """A push only re-reviews what the bot reviewed before; older MRs/PRs are left alone."""
+
+    def gl_collect(self, notes):
+        def fake_api_json(base, token, platform, path, body=None, accept="application/json", method=None):
+            if path == "/projects/1":
+                return {"permissions": {"project_access": {"access_level": 40}}}
+            if "/notes" in path:
+                return notes
+            if "/changes" in path:
+                return {"changes": [{"new_path": "a.py", "diff": "@@ -0,0 +1 @@\n+x"}], "overflow": False}
+            return {"author": {"username": "alice"}, "diff_refs": {"head_sha": "s"}}
+        payload = {"object_kind": "merge_request", "project": {"id": 1},
+                   "object_attributes": {"iid": 2, "action": "update", "state": "opened", "oldrev": "o"}}
+        with patch.object(server, "api_json", side_effect=fake_api_json):
+            return server.collect_gitlab(payload, GL_CONFIG)
+
+    def test_push_to_never_reviewed_mr_is_ignored(self):
+        result = self.gl_collect([{"body": "human note"}])
+        self.assertIsInstance(result, str)
+        self.assertIn("never reviewed", result)
+
+    def test_push_to_reviewed_mr_is_collected(self):
+        self.assertIsInstance(self.gl_collect([{"body": "<!-- ai-review -->\nsummary"}]), dict)
+
+    def test_github_push_to_never_reviewed_pr_is_ignored(self):
+        payload = {"action": "synchronize", "number": 5, "repository": {"full_name": "acme/w"}}
+        config = {"token": "gh", "secret": SECRET, "url": "https://api.github.com"}
+        with patch.object(server, "reviewer_of", return_value="bot"), \
+                patch.object(server, "api_json", return_value=[{"user": {"login": "alice"}}]), \
+                patch.object(server, "api") as api:
+            self.assertIn("never reviewed", server.collect_github(payload, config))
+        api.assert_not_called()  # no diff fetched for an ignored push
+        with patch.object(server, "reviewer_of", return_value="bot"), \
+                patch.object(server, "api_json", return_value=[{"user": {"login": "bot"}}]):
+            self.assertTrue(server.gh_reviewed_before("https://api.github.com", "gh", "acme/w", 5))
+
+
+class RereviewFlowTests(unittest.TestCase):
+    """A re-review carries our open findings and withdraws a stale approval."""
+
+    JOB = {"base": "b", "token": "t", "path": "/projects/1/merge_requests/2", "pid": 1, "iid": 2,
+           "files": [{"new_path": "a.py", "diff": "@@ -0,0 +1 @@\n+x"}], "author": "alice",
+           "header": "h", "level": 40, "draft": False, "refs": {}, "head": "sha2",
+           "diff": "@@ -0,0 +1 @@\n+x"}
+    FINDING = {"id": "d1", "notes": [{"author": {"username": "bot"}, "resolvable": True, "resolved": False,
+                                      "body": "<!-- ai-review -->\n### WARNING\nNull deref.\n\n*Fix:* guard it",
+                                      "position": {"new_path": "a.py", "new_line": 1}}]}
+
+    def setUp(self):
+        server._reviewed.clear()
+
+    def run_push(self, review, approved=True):
+        calls = []
+
+        def fake_api_json(base, token, platform, path, body=None, accept="application/json", method=None):
+            calls.append((path, method or ("POST" if body is not None else "GET")))
+            if path.endswith("/discussions?per_page=100"):
+                return [self.FINDING]
+            if path.endswith("/approvals"):
+                return {"user_has_approved": approved}
+            return {}
+        payload = {"object_kind": "merge_request", "project": {"id": 1, "path_with_namespace": "acme/w"},
+                   "object_attributes": {"iid": 2, "action": "update", "state": "opened", "oldrev": "sha1"}}
+        with patch.object(server, "collect_gitlab", return_value=dict(self.JOB)), \
+                patch.object(server, "api_json", side_effect=fake_api_json), \
+                patch.object(server, "api"), patch.object(server, "reviewer_of", return_value="bot"), \
+                patch.object(server, "gl_post_inline", return_value=set()), \
+                patch.object(server, "gl_resolve_fixed", return_value=0), \
+                patch.object(server, "superseded", return_value=False), \
+                patch.object(server, "gl_approve", return_value=True), \
+                patch.object(server, "run_hermes", return_value=review) as hermes:
+            self.assertTrue(server.process("gitlab", "Merge Request Hook", payload, GL_CONFIG))
+        return hermes.call_args[0][0], calls
+
+    def test_prompt_lists_open_findings(self):
+        prompt, _ = self.run_push("ok\nVERDICT: APPROVE")
+        self.assertIn("re-review after new commits", prompt)
+        self.assertIn("`a.py:1` WARNING: Null deref.", prompt)
+
+    def test_request_changes_withdraws_our_approval(self):
+        _, calls = self.run_push("bad\nVERDICT: REQUEST_CHANGES")
+        self.assertIn(("/projects/1/merge_requests/2/unapprove", "POST"), calls)
+
+    def test_nothing_to_withdraw_when_we_never_approved(self):
+        _, calls = self.run_push("bad\nVERDICT: REQUEST_CHANGES", approved=False)
+        self.assertNotIn(("/projects/1/merge_requests/2/unapprove", "POST"), calls)
+
+    def test_github_dismisses_our_approval(self):
+        calls = []
+
+        def fake_api_json(base, token, platform, path, body=None, accept="application/json", method=None):
+            calls.append((path, method, body))
+            return [{"id": 9, "user": {"login": "bot"}, "state": "APPROVED"},
+                    {"id": 8, "user": {"login": "alice"}, "state": "APPROVED"}]
+        with patch.object(server, "api_json", side_effect=fake_api_json):
+            self.assertEqual(server.gh_dismiss_approvals("b", "t", "acme/w", 5, "bot"), 1)
+        self.assertEqual(calls[1][:2], ("/repos/acme/w/pulls/5/reviews/9/dismissals", "PUT"))
+
+    def test_github_open_findings_skip_outdated(self):
+        comments = [{"user": {"login": "bot"}, "path": "a.py", "line": 3, "body": "**CRITICAL** SQL injection."},
+                    {"user": {"login": "bot"}, "path": "a.py", "line": None, "body": "**WARNING** old."},
+                    {"user": {"login": "alice"}, "path": "a.py", "line": 4, "body": "**WARNING** human."}]
+        with patch.object(server, "api_json", return_value=comments):
+            self.assertEqual(server.gh_open_findings("b", "t", "acme/w", 5, "bot"),
+                             ["- `a.py:3` CRITICAL: SQL injection."])
+
+
+class StanceTests(unittest.TestCase):
+    def test_parse(self):
+        cases = {
+            "STANCE: CONCEDE\nYou're right — x.": ("CONCEDE", "You're right — x."),
+            "**STANCE: DEFEND**\nStill holds: a.py:3.": ("DEFEND", "Still holds: a.py:3."),
+            "STANCE: NO_REPLY": ("NO_REPLY", ""),
+            "STANCE: no reply": ("NO_REPLY", ""),
+            "NO_REPLY": ("NO_REPLY", ""),
+            "Just an answer.": ("ANSWER", "Just an answer."),
+            "STANCE: BANANA\nhi": ("ANSWER", "hi"),
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(server.stance_of(text), expected)
+
+
+class DecisionFlowTests(unittest.TestCase):
+    """No reply for acknowledgements; a concession resolves the thread and is remembered."""
+
+    def setUp(self):
+        server._replied.clear()
+        server._cooldown.clear()
+        self.saved = server.BOT_USERNAME, server._memory
+        server.BOT_USERNAME = "bot"
+        server._memory = server.Memory(os.path.join(tempfile.mkdtemp(), "m.db"))
+        self.config = {"token": "gl", "secret": SECRET, "url": "https://gl"}
+
+    def tearDown(self):
+        server._memory.close()
+        server.BOT_USERNAME, server._memory = self.saved
+        server._replied.clear()
+        server._cooldown.clear()
+
+    def payload(self, note="That check is fine, the value is validated upstream."):
+        return {"object_kind": "note", "project_id": 1, "project": {"id": 1, "path_with_namespace": "acme/w"},
+                "user": {"username": "alice"}, "merge_request": {"iid": 2},
+                "object_attributes": {"note": note, "noteable_type": "MergeRequest", "noteable_iid": 2,
+                                      "discussion_id": "d1", "id": 7}}
+
+    def run_debate(self, answer):
+        posts, seen = [], {}
+        thread = {"id": "d1", "notes": [
+            {"author": {"username": "bot"}, "resolvable": True, "resolved": False,
+             "body": "<!-- ai-review -->\n### WARNING\nUnvalidated input.\n\n*Fix:* validate it",
+             "position": {"new_path": "a.py", "new_line": 4}},
+            {"author": {"username": "alice"}, "body": "It is validated upstream."}]}
+
+        def fake_api(base, token, platform, path, body=None, accept="application/json", method=None):
+            if body is not None:
+                posts.append((path, method or "POST"))
+                return b'{"id": 5}'
+            if path == "/projects/1":
+                return json.dumps({"permissions": {"project_access": {"access_level": 40}}}).encode()
+            if "/discussions" in path:
+                return json.dumps([thread]).encode()
+            return b"{}"
+        with patch.object(server, "api", side_effect=fake_api), \
+                patch.object(server, "run_hermes", return_value=answer):
+            result = server.debate("gitlab", self.payload(), self.config,
+                                   lambda stage, **kw: seen.update(kw))
+        return result, posts, seen
+
+    def test_no_reply_posts_nothing(self):
+        result, posts, seen = self.run_debate("STANCE: NO_REPLY")
+        self.assertFalse(result)
+        self.assertEqual(posts, [])
+        self.assertIn("no reply needed", seen["remark"])
+
+    def test_concede_resolves_thread_and_records_mistake(self):
+        result, posts, seen = self.run_debate(
+            "STANCE: CONCEDE\nYou're right — the input is validated by the serializer.")
+        self.assertTrue(result)
+        self.assertEqual(posts[0], ("/projects/1/merge_requests/2/discussions/d1/notes", "POST"))
+        self.assertIn(("/projects/1/merge_requests/2/discussions/d1?resolved=true", "PUT"), posts)
+        self.assertIn("thread resolved", seen["remark"])
+        self.assertIn("mistake #1 recorded", seen["remark"])
+        lessons = server._memory.lessons("acme/w")
+        self.assertEqual(len(lessons), 1)
+        self.assertEqual(lessons[0]["file"], "a.py")
+        self.assertIn("Unvalidated input", lessons[0]["finding"])
+        self.assertIn("validated by the serializer", lessons[0]["lesson"])
+
+    def test_defend_keeps_thread_open_and_records_nothing(self):
+        result, posts, seen = self.run_debate("STANCE: DEFEND\nStill holds: a.py:4 reads raw query params.")
+        self.assertTrue(result)
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(seen["remark"], "defended")
+        self.assertEqual(server._memory.count(), 0)
+
+    def test_reply_body_never_shows_the_stance_line(self):
+        with patch.object(server, "api") as api, \
+                patch.object(server, "api_json", return_value={}), \
+                patch.object(server, "gl_access_level", return_value=40), \
+                patch.object(server, "gl_thread", return_value=""), \
+                patch.object(server, "bounded_diff", return_value=""), \
+                patch.object(server, "reviewer_of", return_value="bot"), \
+                patch.object(server, "run_hermes", return_value="STANCE: ANSWER\nIt runs once per request."):
+            self.assertTrue(server.debate("gitlab", self.payload(note="@bot when does it run?"), self.config))
+        body = api.call_args[0][4]["body"]
+        self.assertIn("It runs once per request.", body)
+        self.assertNotIn("STANCE", body)
+
+
+class MemoryTests(unittest.TestCase):
+    def setUp(self):
+        self.memory = server.Memory(os.path.join(tempfile.mkdtemp(), "m.db"))
+        self.addCleanup(self.memory.close)
+
+    def test_disabled_without_path(self):
+        memory = server.Memory("")
+        self.assertIsNone(memory.record_mistake("gitlab", "acme/w", "x"))
+        self.assertEqual((memory.lessons("acme/w"), memory.count()), ([], 0))
+
+    def test_same_mistake_is_stored_once(self):
+        args = ("gitlab", "acme/w", "Unvalidated input.")
+        self.assertEqual(self.memory.record_mistake(*args, file="a.py", line=4), 1)
+        self.assertIsNone(self.memory.record_mistake(*args, file="a.py", line=4))
+        self.assertEqual(self.memory.count(), 1)
+
+    def test_lessons_are_per_repo_newest_first_and_capped(self):
+        for n in range(5):
+            self.memory.record_mistake("gitlab", "acme/w", "finding %d" % n)
+            time.sleep(0.001)
+        self.memory.record_mistake("gitlab", "other/r", "elsewhere")
+        lessons = self.memory.lessons("acme/w", limit=3)
+        self.assertEqual([l["finding"] for l in lessons], ["finding 4", "finding 3", "finding 2"])
+
+    def test_survives_reopen(self):
+        path = os.path.join(tempfile.mkdtemp(), "m.db")
+        first = server.Memory(path)
+        first.record_mistake("gitlab", "acme/w", "kept")
+        first.close()
+        again = server.Memory(path)
+        self.addCleanup(again.close)
+        self.assertEqual(again.count(), 1)
+
+    def test_lessons_reach_the_review_prompt(self):
+        saved = server._memory
+        server._memory = self.memory
+        try:
+            self.memory.record_mistake("gitlab", "acme/w", "Flagged Decimal rounding.", file="m.py",
+                                       level="WARNING", lesson="You're right — ROUND_HALF_UP is required.")
+            block = server.lessons_block("acme/w")
+            self.assertIn("Lessons from earlier reviews", block)
+            self.assertIn("[WARNING] in m.py Flagged Decimal rounding.", block)
+            self.assertIn("ROUND_HALF_UP", block)
+            self.assertEqual(server.lessons_block("other/r"), "")
+        finally:
+            server._memory = saved
 
 
 if __name__ == "__main__":

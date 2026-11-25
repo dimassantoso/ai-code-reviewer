@@ -15,7 +15,7 @@ SC    := systemctl --user
 export XDG_RUNTIME_DIR ?= /run/user/$(shell id -u)
 
 .DEFAULT_GOAL := help
-.PHONY: help start stop restart status health dash url log logs password test deploy reset add skill
+.PHONY: help start stop restart status health dash url log logs password test deploy reset add skill mistakes
 
 help:  ## list targets
 	@grep -E '^[a-z]+:.*## ' $(MAKEFILE_LIST) | sed 's/:.*## /\t/' | column -t -s "$$(printf '\t')"
@@ -77,6 +77,13 @@ skill:  ## install SKILL.md into the Hermes home the service uses (backs up the 
 	 if [ -f "$$dest/SKILL.md" ] && ! cmp -s $(DIR)/SKILL.md "$$dest/SKILL.md"; then \
 	   cp "$$dest/SKILL.md" "$$dest/SKILL.md.$$(date +%Y%m%d-%H%M%S).bak"; fi; \
 	 cp $(DIR)/SKILL.md "$$dest/SKILL.md" && echo "skill installed: $$dest/SKILL.md"
+
+MEM_RAW := $(shell grep -m1 '^MEMORY_DB=' $(ENV) 2>/dev/null | cut -d= -f2)
+MEM     := $(if $(filter /%,$(MEM_RAW)),$(MEM_RAW),$(DIR)/$(patsubst ./%,%,$(MEM_RAW)))
+
+mistakes:  ## findings the bot conceded were wrong (newest first): make mistakes [N=20]
+	@test -n "$(MEM_RAW)" || { echo "MEMORY_DB is not set in .env"; exit 1; }
+	@python3 -c 'import sqlite3,sys,time; db=sqlite3.connect(sys.argv[1]); rows=db.execute("SELECT created,repo,target,file,line,level,finding,commenter,lesson FROM mistakes ORDER BY created DESC LIMIT ?",(int(sys.argv[2]),)).fetchall(); print("%d total" % db.execute("SELECT COUNT(*) FROM mistakes").fetchone()[0]); [print("\n%s  %s %s  %s:%s [%s] by @%s\n  finding: %s\n  lesson:  %s" % (time.strftime("%Y-%m-%d %H:%M",time.localtime(r[0])),r[1],r[2],r[3] or "-",r[4] or "-",r[5] or "-",r[7],r[6][:200],r[8][:200])) for r in rows]' "$(MEM)" "$(or $(N),20)"
 
 test:  ## run the test suite
 	cd $(DIR) && python3 -m unittest discover -s tests
