@@ -132,7 +132,7 @@ Actions need the dashboard login and an `X-Dashboard: 1` header, and cross-site 
 
 ## The review skill
 
-`SKILL.md` is the rubric and output format loaded into every model call: what the model can see, the seven review gates, checks per language, the verdict rules and the reply rules. Edit it in this repo and install it with `make skill`, which copies it into the Hermes home (`HERMES_HOME`, `HERMES_PROFILE`) and keeps a `.bak` of the previous one. The change applies to the next review without a restart. Don't edit the installed copy; the next `make deploy` overwrites it.
+`SKILL.md` is the rubric and output format loaded into every model call: what the model can see, how to work through a diff, the seven review gates, domain checks (money, personal data, migrations, infrastructure, shell, dependencies), checks per language, severity calibration with examples, the verdict rules and the reply rules. Edit it in this repo and install it with `make skill`, which copies it into the Hermes home (`HERMES_HOME`, `HERMES_PROFILE`) and keeps a `.bak` of the previous one. The change applies to the next review without a restart. Don't edit the installed copy; the next `make deploy` overwrites it.
 
 ## Running it on a server
 

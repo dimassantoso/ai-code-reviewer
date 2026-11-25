@@ -121,10 +121,11 @@
   .trunc { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
   .sub { display:block; margin-top:1px; color:var(--ink-3); font-size:11.5px;
          overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .sm-only { display:none; }
+  .sm-only, .lg-hide { display:none; }
+  .w-author { width:130px; }
   .w-when { width:80px; } .w-verdict { width:160px; } .w-inline { width:62px; } .w-dur { width:86px; }
   .w-status { width:104px; } .w-acts { width:84px; } .w-stage { width:230px; } .w-elapsed { width:90px; }
-  .w-remark { width:28%; }
+  .w-remark { width:24%; }
   tbody tr:last-child td { border-bottom:0; }
   tbody tr.row { cursor:pointer; }
   tbody tr.row:hover, tbody tr.row.open { background:var(--surface-2); }
@@ -231,6 +232,11 @@
     .filters input { width:100%; }
     .filters .grow { display:none; }
   }
+  /* Below 1200px the Author column folds into a line under the MR name */
+  @media (max-width:1200px) {
+    .c-lg { display:none; }
+    .lg-hide { display:block; }
+  }
   @media (max-width:1024px) {
     .c-md { display:none; }   /* Inline and Remark move to the expanded row */
   }
@@ -329,11 +335,11 @@
     <div class="tbl">
       <table>
         <thead><tr>
-          <th scope="col">Target</th><th scope="col" class="w-stage">Stage</th>
+          <th scope="col">Target</th><th scope="col" class="w-author c-lg">Author</th><th scope="col" class="w-stage">Stage</th>
           <th scope="col" class="num w-elapsed">Elapsed</th>
           <th scope="col" class="acts w-acts"><span class="sr">Actions</span></th>
         </tr></thead>
-        <tbody id="live"><tr><td colspan="4" class="empty">Idle — waiting for a webhook</td></tr></tbody>
+        <tbody id="live"><tr><td colspan="5" class="empty">Idle — waiting for a webhook</td></tr></tbody>
       </table>
     </div>
   </section>
@@ -344,6 +350,7 @@
       <table>
         <thead><tr>
           <th scope="col">Merge request</th>
+          <th scope="col" class="w-author c-lg">Author</th>
           <th scope="col" class="w-when c-sm">Updated</th>
           <th scope="col" class="w-verdict">Latest verdict</th>
           <th scope="col" class="num w-runs c-md">Runs</th>
@@ -351,7 +358,7 @@
           <th scope="col" class="w-remark c-md">Note</th>
           <th scope="col" class="acts w-acts"><span class="sr">Actions</span></th>
         </tr></thead>
-        <tbody id="hist"><tr><td colspan="7" class="empty">No reviews yet</td></tr></tbody>
+        <tbody id="hist"><tr><td colspan="8" class="empty">No reviews yet</td></tr></tbody>
       </table>
     </div>
     <div class="foot"><span id="hist-count"></span><div class="pager" id="pager"></div></div>
@@ -413,7 +420,8 @@ const NAME = {rereview: "Re-review", delete: "Delete record", stop: "Stop review
 const actBtn = (act, rec, extra = "") => `<button type="button" class="act${act === "rereview" ? "" : " danger"}" data-act="${act}"
   data-id="${rec.id}" data-label="${esc(rec.target)}" aria-label="${NAME[act]} ${esc(rec.target)}" title="${NAME[act]}" ${extra}>${BTN[act]}</button>`;
 const targetCell = (rec, more = "") => `<td><span class="trunc mono">${link(rec.target, rec.url)}</span>
-  <span class="sub">${esc(rec.author) || "–"}${more}</span></td>`;
+  <span class="sub lg-hide">${esc(rec.author) || "–"}${more}</span></td>
+  <td class="c-lg"><span class="trunc" title="${esc(rec.author)}">${esc(rec.author) || '<span class="faint">–</span>'}</span></td>`;
 const statusBadge = s => badge(STATUS[s] || ["b-mute", "dash", s || "—"]);
 const verdictBadge = v => v ? badge(VERDICT[v] || ["b-mute", "dash", v]) : '<span class="faint">–</span>';
 
@@ -569,7 +577,7 @@ function renderLive(live) {
       <td class="nowrap"><span class="steps" role="img" aria-label="Stage ${at + 1} of 4: ${esc(j.stage)}" title="${esc(j.stage)}">${steps}</span><span class="stage">${esc(j.stage)}</span></td>
       <td class="num">${secs(j.elapsed)}</td>
       <td class="acts">${actBtn("stop", j)}</td></tr>`;
-  }).join("") : '<tr><td colspan="4" class="empty">Idle — waiting for a webhook</td></tr>';
+  }).join("") : '<tr><td colspan="5" class="empty">Idle — waiting for a webhook</td></tr>';
 }
 
 // ---- merge requests: one row per MR/PR, newest activity first ---------------------
@@ -610,7 +618,7 @@ function renderHistory(rows) {
       <td>${statusBadge(l.status)}</td>
       <td class="c-md"><span class="trunc remark ${l.error ? "bad" : ""}" title="${esc(why)}">${esc(why) || '<span class="faint">–</span>'}</span></td>
       <td class="acts">${actBtn("rereview", rec, g.url ? "" : "disabled")}${CHEV}</td></tr>`;
-  }).join("") : `<tr><td colspan="7" class="empty">${state.status || state.q ? "Nothing matches these filters" : "No reviews in this range"}</td></tr>`;
+  }).join("") : `<tr><td colspan="8" class="empty">${state.status || state.q ? "Nothing matches these filters" : "No reviews in this range"}</td></tr>`;
 }
 
 // ---- detail view: #mr=<key> ------------------------------------------------------
