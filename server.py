@@ -40,11 +40,14 @@ MAX_INLINE = int(os.getenv("MAX_INLINE", "20"))  # inline comments posted per re
 DASHBOARD_USER = os.getenv("DASHBOARD_USER", "admin")
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")  # blank = dashboard is open
 
+# Must match the "Output format" section of SKILL.md: parse_inline_comments() reads
+# `path:line` bullets under severity headings, verdict_of() reads the last verdict line.
 REVIEW_FORMAT = (
-    "When you find issues, list them under a section titled '### Inline Comments', one per line, format:\n"
-    "- `path/to/file.py:42` CRITICAL: Description. Fix: suggested fix.\n"
-    "Use the EXACT new line number present in the diff. Levels: CRITICAL, WARNING, SUGGESTION. "
-    "Then give the summary review, ending with a single line: VERDICT: APPROVE or VERDICT: REQUEST_CHANGES."
+    "Output format: a short summary, then one section per severity that has findings — "
+    "'### Critical', '### Warning', '### Suggestion' — with one bullet per finding:\n"
+    "- `path/to/file.py:42` — Description. Fix: suggested fix.\n"
+    "Use the EXACT new-side line number present in the diff and list each finding once. "
+    "End with a single final line: VERDICT: APPROVE or VERDICT: REQUEST_CHANGES."
 )
 _replied = set()
 _replied_lock = threading.Lock()

@@ -3,3 +3,10 @@ __pycache__/
 .env
 hermes-home/
 *.log
+.agents/
+.claude/skills/
+skills-lock.json
+*.db
+*.db-wal
+*.db-shm
+reviews.jsonl*

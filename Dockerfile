@@ -11,11 +11,9 @@ COPY dashboard.html /app/dashboard.html
 # Bundled-skills dir: the image's stage2 hook syncs /opt/hermes/skills into
 # $HERMES_HOME/skills on every boot, which is how `hermes -s ai-code-reviewer`
 # resolves the skill inside the container.
+# The skill is one self-contained file: reviews run with no toolsets, so the model
+# cannot open anything beside it.
 COPY SKILL.md /opt/hermes/skills/ai-code-reviewer/SKILL.md
-COPY github/ /opt/hermes/skills/ai-code-reviewer/github/
-COPY gitlab/ /opt/hermes/skills/ai-code-reviewer/gitlab/
-COPY references/ /opt/hermes/skills/ai-code-reviewer/references/
-COPY templates/ /opt/hermes/skills/ai-code-reviewer/templates/
 
 ENV PYTHONUNBUFFERED=1
 ENV HERMES_SKILL=ai-code-reviewer

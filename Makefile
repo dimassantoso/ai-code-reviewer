@@ -15,7 +15,7 @@ SC    := systemctl --user
 export XDG_RUNTIME_DIR ?= /run/user/$(shell id -u)
 
 .DEFAULT_GOAL := help
-.PHONY: help start stop restart status health dash url log logs password test deploy reset add
+.PHONY: help start stop restart status health dash url log logs password test deploy reset add skill
 
 help:  ## list targets
 	@grep -E '^[a-z]+:.*## ' $(MAKEFILE_LIST) | sed 's/:.*## /\t/' | column -t -s "$$(printf '\t')"
@@ -64,9 +64,24 @@ password:  ## set the dashboard password: make password NEW=secret
 	@python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); ls=[l for l in p.read_text().splitlines() if not l.startswith("DASHBOARD_PASSWORD=")]; p.write_text("\n".join(ls+["DASHBOARD_PASSWORD="+sys.argv[2]])+"\n"); p.chmod(0o600)' "$(ENV)" "$(NEW)"
 	@$(MAKE) --no-print-directory restart
 
+# Hermes home the service uses: HERMES_HOME from .env, else ~/.hermes; with
+# HERMES_PROFILE set, skills live under profiles/<name>/.
+HHOME   := $(or $(shell grep -m1 '^HERMES_HOME=' $(ENV) 2>/dev/null | cut -d= -f2),$(HOME)/.hermes)
+HPROF   := $(shell grep -m1 '^HERMES_PROFILE=' $(ENV) 2>/dev/null | cut -d= -f2)
+HSKILLS := $(HHOME)$(if $(HPROF),/profiles/$(HPROF))/skills
+HSKILL  := $(or $(shell grep -m1 '^HERMES_SKILL=' $(ENV) 2>/dev/null | cut -d= -f2),ai-code-reviewer)
+
+skill:  ## install SKILL.md into the Hermes home the service uses (backs up the old one)
+	@dest=$$(find $(HSKILLS) -mindepth 1 -maxdepth 3 -type d -name '$(HSKILL)' 2>/dev/null | head -1); \
+	 dest=$${dest:-$(HSKILLS)/$(HSKILL)}; mkdir -p "$$dest"; \
+	 if [ -f "$$dest/SKILL.md" ] && ! cmp -s $(DIR)/SKILL.md "$$dest/SKILL.md"; then \
+	   cp "$$dest/SKILL.md" "$$dest/SKILL.md.$$(date +%Y%m%d-%H%M%S).bak"; fi; \
+	 cp $(DIR)/SKILL.md "$$dest/SKILL.md" && echo "skill installed: $$dest/SKILL.md"
+
 test:  ## run the test suite
 	cd $(DIR) && python3 -m unittest discover -s tests
 
 deploy:  ## pull origin/master, restart, health check
 	cd $(DIR) && git fetch -q origin && git reset --hard -q origin/master && git log --oneline -1
+	@$(MAKE) --no-print-directory skill
 	@$(MAKE) --no-print-directory restart

@@ -44,7 +44,11 @@ Copy `.env.example` to `.env` and fill in at least one platform token and its we
 | `HERMES_BIN` | CLI executable; default `hermes` on PATH. |
 | `HERMES_MODEL` | Optional model override; otherwise use Hermes configuration. |
 | `HERMES_SKILL` | Optional skill name; example sets `ai-code-reviewer`. |
-| `HERMES_TIMEOUT_S` | CLI timeout in seconds; default `300`. |
+| `HERMES_PROFILE` | Optional Hermes profile, passed as `-p`. |
+| `HERMES_TIMEOUT_S` | Timeout for one model call, in seconds; default `300`. |
+| `MAX_DIFF` | Diff characters per model call; larger diffs are split into chunks. Default `30000`, sized so one call finishes inside the timeout. |
+| `REVIEW_BUDGET_S` | Wall-clock budget for all model calls in one review. Chunks not reached in time are skipped and named in the posted comment. Default `1200`. |
+| `REVIEW_REPOS` | Comma-separated `group/project` or `owner/repo` allowlist. Empty reviews every repo that sends a hook. |
 | `MAX_WORKERS` | Concurrent reviews; each one runs a `hermes` subprocess. Default `4`. |
 | `QUEUE_SIZE` | Pending reviews held before new webhooks get `503`. Default `100`. |
 | `BOT_USERNAME` | GitLab username to answer mentions. Blank disables debate replies entirely. |
@@ -53,7 +57,6 @@ Copy `.env.example` to `.env` and fill in at least one platform token and its we
 | `COOLDOWN_SECONDS` | Per-user per-thread debate cooldown. Default `30`. |
 | `MAX_INLINE` | Inline comments posted per review. Default `20`. |
 | `API_ATTEMPTS` | Tries per platform API call when the connection resets. Default `3`. HTTP errors are never retried. |
-| `MAX_DEBATE_DIFF` | Diff characters handed to a debate reply. Default `20000`. |
 | `DASHBOARD_USER`, `DASHBOARD_PASSWORD` | HTTP Basic auth for `/dashboard` and `/api/reviews`. Blank password leaves them open; the browser shows its own login prompt, so no token in the URL. |
 | `REVIEW_STORE` | Optional JSONL path for review history. Unset keeps history in memory only (lost on restart). |
 | `REVIEW_EST_S` | Expected review duration, used to scale the progress bar. Default `60`. |
@@ -67,8 +70,7 @@ Install and configure [Hermes Agent](https://hermes-agent.nousresearch.com/docs/
 ```bash
 export HERMES_HOME="$HOME/.hermes-reviewer"
 mkdir -p "$HERMES_HOME/skills/ai-code-reviewer"
-cp SKILL.md "$HERMES_HOME/skills/ai-code-reviewer/"
-cp -R github gitlab references templates "$HERMES_HOME/skills/ai-code-reviewer/"
+cp SKILL.md "$HERMES_HOME/skills/ai-code-reviewer/"   # or: make skill (reads HERMES_HOME/HERMES_PROFILE from .env)
 hermes setup
 hermes skills list
 cp .env.example .env
@@ -133,17 +135,17 @@ the store, then restarts.
 - Webhooks that cannot produce a review — `Push Hook`, MR `close`/`merge`/label events, unrelated CI hooks — return `200 ignored` and are never recorded on the dashboard. Only real reviews and debate replies create a row.
 - `GET /dashboard` is a live review dashboard; `GET /api/reviews` is the same data as JSON. Both are read-only and ask for HTTP Basic login when `DASHBOARD_PASSWORD` is set.
 - Valid requests are acknowledged with `202 accepted` before background processing. This is not proof a review was posted; inspect logs and the MR/PR. Duplicate payloads are suppressed in memory for five minutes, not durably across restarts.
-- **A review runs when the MR/PR is created.** GitLab `open`, GitHub `opened`, plus the one exception that matters: a draft becoming ready (GitLab `update` with `draft` going true -> false, GitHub `ready_for_review`) — otherwise a draft opened as a draft would never be reviewed. Pushes, reopens, label and title edits do not trigger a review. Both platforms get inline comments on lines that exist in the diff (GitLab as discussions, GitHub as a batched review) plus a summary; `MAX_INLINE` caps them per review (default 20).
+- A review is triggered when an MR/PR is opened (GitLab action `open`, GitHub `opened`) or marked ready (see below). New pushes to an open MR/PR, reopen and other updates do not trigger a new review. Both platforms get inline comments on lines that exist in the diff (GitLab as discussions, GitHub as a batched review) plus a summary; `MAX_INLINE` caps them per review (default 20).
 - **Live dashboard.** `/dashboard` streams over Server-Sent Events (`/api/events`), so the page updates on every stage change instead of polling every 2s. History is paged in the browser (25/page); `/api/reviews` still returns the whole snapshot for scripts.
 - **Resolved threads are respected.** After a re-review the bot closes its own inline discussions whose finding is gone from the new review — only bot-authored threads, only still-unresolved ones, and never a thread a human has replied in (that one is theirs to close). One already resolved is left untouched.
 - Only **open, non-draft** merge requests and pull requests are reviewed. A draft is skipped when opened and reviewed when it is marked ready (GitLab `update` with `draft` false, GitHub `ready_for_review`). Closed and merged MRs/PRs are ignored, never recorded.
 - Auto-approve: verdict `APPROVE` and the token user may approve. GitLab additionally requires access ≥ `APPROVE_ACCESS_LEVEL` and checks `user_can_approve`; GitHub requires push permission on the repo.
 - A review whose head commit moved while the model was thinking is discarded, so a stale verdict never lands on newer code.
-- A target whose head SHA was already reviewed is skipped. This is what stops the approve -> update event -> approve loop: our own approval fires a fresh MR event with identical code. Push a new commit and the head changes, so it is reviewed again. The memory is in-process (cleared on restart).
+- A target whose head SHA was already reviewed is skipped. This is what stops the approve -> update event -> approve loop: our own approval fires a fresh MR event with identical code. The memory is in-process (cleared on restart).
 - Debate: a GitLab note or GitHub comment that `@BOT_USERNAME` gets an in-thread answer — and inside a thread the bot opened, the reply alone is enough, no mention needed. Our own replies are never answered.
-- **A comment is judged before anything is recorded.** `comment_decision()` answers "does this owe a reply, and why not" in one place — wrong note type, our own reply, bot author, missing author, no mention outside our own thread — and a comment that fails creates no dashboard row at all. Only answered comments are recorded, so the history stays reviews and real conversations instead of every echo of the bot's own output. Per-note dedupe, per-thread cooldown (`COOLDOWN_SECONDS`), a bounded transcript of that discussion, and the diff under discussion (up to `MAX_DEBATE_DIFF`); GitLab additionally requires `MIN_ACCESS_LEVEL`. Bot and `[bot]` authors are ignored. Blank `BOT_USERNAME` disables it.
+- **A comment is judged before anything is recorded.** `comment_decision()` answers "does this owe a reply, and why not" in one place — wrong note type, our own reply, bot author, missing author, no mention outside our own thread — and a comment that fails creates no dashboard row at all. Only answered comments are recorded, so the history stays reviews and real conversations instead of every echo of the bot's own output. Per-note dedupe, per-thread cooldown (`COOLDOWN_SECONDS`), a bounded transcript of that discussion, and the diff under discussion (up to 20,000 characters); GitLab additionally requires `MIN_ACCESS_LEVEL`. Bot and `[bot]` authors are ignored. Blank `BOT_USERNAME` disables it.
 - A dropped connection (`Connection reset by peer`) during a platform API call is retried up to `API_ATTEMPTS` times with a short backoff instead of failing the review. HTTP errors (401/404) are not retried.
-- Diffs larger than `MAX_DIFF` (100,000 characters) are reviewed in chunks — several model calls over file and hunk boundaries, merged with the strictest verdict — instead of being rejected or truncated. API and Hermes errors are logged; retries and persistence are not guaranteed after acknowledgement.
+- Diffs larger than `MAX_DIFF` (default 30,000 characters) are reviewed in chunks — several model calls over file and hunk boundaries, merged with the strictest verdict — instead of being rejected or truncated. All calls share the `REVIEW_BUDGET_S` budget; chunks it does not reach are skipped and labelled as a partial review. API and Hermes errors are logged; retries and persistence are not guaranteed after acknowledgement.
 
 Review input is untrusted. The service requests empty Hermes toolsets and strips platform credentials from the CLI child environment, but use a dedicated least-privilege account and review model output before acting on it.
 
@@ -167,8 +169,13 @@ make dash        # dashboard URL + where the password lives
 make log         # last 100 lines of server.log
 make logs        # stream server.log
 make password NEW=secret   # rewrite DASHBOARD_PASSWORD and restart
-make deploy      # git pull origin/master, restart, health check
+make skill       # install SKILL.md (the review rubric) into the service's Hermes home
+make deploy      # git pull origin/master, install the skill, restart, health check
 ```
+
+`SKILL.md` is the reviewer's rubric and output contract, loaded into every model call via
+`HERMES_SKILL`. Edit it here and run `make skill`; don't edit the installed copy, or the next
+deploy overwrites it.
 
 `make` resolves the host from `tailscale status` (MagicDNS name), so the printed URL keeps working when the tailnet IP changes.
 

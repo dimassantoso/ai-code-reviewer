@@ -580,7 +580,7 @@ class GitHubFlowTests(IsolatedCase):
         self.assertIn("print(1)", prompt)
         self.assertIn("PR #5: Add auth", prompt)
         self.assertIn("Author: @alice", prompt)
-        self.assertIn("### Inline Comments", prompt)
+        self.assertIn("### Critical", prompt)
         self.assertEqual(len(posts), 1)
         inline_path, inline_body = posts[0]
         self.assertEqual(inline_path, "/repos/acme/widgets/pulls/5/reviews")
