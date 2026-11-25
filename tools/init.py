@@ -55,7 +55,6 @@ SECTIONS = [
         ("MAX_DIFF", "30000", "diff characters per model call before chunking"),
         ("REVIEW_BUDGET_S", "1200", "wall-clock budget for one chunked review"),
         ("MAX_INLINE", "20", "inline comments per review"),
-        ("PUSH_DEBOUNCE_S", "60", "seconds after the last push before re-reviewing"),
         ("REVIEW_REPOS", "", "allowlist group/project,owner/repo (blank = every hooked repo)"),
         ("COOLDOWN_SECONDS", "30", "per-user per-thread reply cooldown"),
     ]),
@@ -275,8 +274,8 @@ def run_wizard(w, check=None, smoke=None, which=None):
     w.hidden("DASHBOARD_PASSWORD", "Dashboard password", generate=not v.get("DASHBOARD_PASSWORD"))
     w.text("MEMORY_DB", "Mistakes database (blank disables learning)")
 
-    if w.confirm("\nAdjust advanced settings (workers, debounce, diff size, allowlist)?", default=False):
-        for key in ("MAX_WORKERS", "QUEUE_SIZE", "PUSH_DEBOUNCE_S", "MAX_DIFF", "REVIEW_BUDGET_S",
+    if w.confirm("\nAdjust advanced settings (workers, diff size, allowlist)?", default=False):
+        for key in ("MAX_WORKERS", "QUEUE_SIZE", "MAX_DIFF", "REVIEW_BUDGET_S",
                     "HERMES_TIMEOUT_S", "MAX_INLINE", "REVIEW_REPOS", "MIN_ACCESS_LEVEL",
                     "APPROVE_ACCESS_LEVEL", "LESSONS_IN_PROMPT"):
             w.text(key, key)

@@ -60,7 +60,6 @@ Point the platform webhook at `https://<host>/gl-review` or `https://<host>/gh-r
 | `DASHBOARD_USER`, `DASHBOARD_PASSWORD` | HTTP Basic auth for `/dashboard` and `/api/reviews`. Blank password leaves them open; the browser shows its own login prompt, so no token in the URL. |
 | `REVIEW_STORE` | Optional JSONL path for review history. Unset keeps history in memory only (lost on restart). |
 | `REVIEW_EST_S` | Expected review duration, used to scale the progress bar. Default `60`. |
-| `PUSH_DEBOUNCE_S` | Seconds to wait after the last push before re-reviewing, so a burst of pushes costs one review. `0` reviews every push at once. Default `60`. |
 | `MEMORY_DB` | SQLite file of findings the bot conceded were wrong (stdlib `sqlite3`, WAL). Blank disables learning. Example: `./reviewer.db`. |
 | `LESSONS_IN_PROMPT` | How many recent conceded findings for the same repo are added to each review prompt. Default `10`. |
 
@@ -138,8 +137,14 @@ the store, then restarts.
 - Webhooks that cannot produce a review — `Push Hook`, MR `close`/`merge`/label events, unrelated CI hooks — return `200 ignored` and are never recorded on the dashboard. Only real reviews and debate replies create a row.
 - `GET /dashboard` is a live review dashboard; `GET /api/reviews` is the same data as JSON. Both are read-only and ask for HTTP Basic login when `DASHBOARD_PASSWORD` is set.
 - Valid requests are acknowledged with `202 accepted` before background processing. This is not proof a review was posted; inspect logs and the MR/PR. Duplicate payloads are suppressed in memory for five minutes, not durably across restarts.
-- A review is triggered when an MR/PR is opened (GitLab `open`, GitHub `opened`), marked ready (see below), or receives new commits (GitLab `update` carrying `oldrev`, GitHub `synchronize`). Title, label, description and assignee edits and reopens do not trigger one.
-- **Re-review after a push.** Pushes are debounced per MR/PR (`PUSH_DEBOUNCE_S`), and only the newest head is reviewed. The prompt carries the bot's still-open findings, so the model drops fixed ones, keeps real ones at their current line, and doesn't raise new complaints about unchanged code it already accepted. Fixed findings' threads are then resolved. If the re-review requests changes, the bot withdraws its earlier approval (GitLab `unapprove`, GitHub dismisses its approving review). Pushes to drafts are ignored, and so are pushes to an MR/PR the bot never reviewed (one opened before the reviewer was installed): a push only re-reviews what was reviewed before. Marking an old draft ready still triggers its first review. Both platforms get inline comments on lines that exist in the diff (GitLab as discussions, GitHub as a batched review) plus a summary; `MAX_INLINE` caps them per review (default 20).
+- **A review runs only when it is asked for:**
+  - the MR/PR is **opened** (GitLab `open`, GitHub `opened`);
+  - a draft is **marked ready** (GitLab `update` whose top-level `changes.draft` goes true → false, GitHub `ready_for_review`);
+  - the bot is **added as a reviewer** (GitLab `update` whose `changes.reviewers` newly contains `BOT_USERNAME`; GitHub `review_requested` for `BOT_USERNAME`, which GitHub's "Re-request review" button also sends);
+  - a comment says **`@BOT_USERNAME review`** (also `re-review`, `recheck`, optionally after "please" / "can you"). The bot reacts 👀 and reviews the current head.
+
+  **Pushing new commits never triggers a review**, and neither do title, label or description edits or a reopen. GitLab has no reliable webhook for its own "re-request review" button, so on GitLab use the comment command or remove and re-add the bot as reviewer. `BOT_USERNAME` must be the token account's username for reviewer requests to match.
+- **Requested re-reviews** (reviewer request, comment command, dashboard button) skip the "already reviewed this head" memory, and the prompt carries the bot's still-open findings. The model drops fixed ones, keeps real ones at their current line, and doesn't raise new complaints about unchanged code it already accepted. Fixed findings' threads are then resolved. If the re-review requests changes, the bot withdraws its earlier approval (GitLab `unapprove`, GitHub dismisses its approving review). Requests on a draft are held until it is marked ready. Both platforms get inline comments on lines that exist in the diff (GitLab as discussions, GitHub as a batched review) plus a summary; `MAX_INLINE` caps them per review (default 20).
 - **Live dashboard.** `/dashboard` streams over Server-Sent Events (`/api/events`), so the page updates on every stage change instead of polling every 2s. History is paged in the browser (25/page); `/api/reviews` still returns the whole snapshot for scripts.
 - **Resolved threads are respected.** After a re-review the bot closes its own inline discussions whose finding is gone from the new review — only bot-authored threads, only still-unresolved ones, and never a thread a human has replied in (that one is theirs to close). One already resolved is left untouched.
 - Only **open, non-draft** merge requests and pull requests are reviewed. A draft is skipped when opened and reviewed when it is marked ready (GitLab `update` with `draft` false, GitHub `ready_for_review`). Closed and merged MRs/PRs are ignored, never recorded.
@@ -192,7 +197,7 @@ deploy overwrites it.
 Row actions (each needs the dashboard login; the page sends an `X-Dashboard` header and the server refuses cross-site requests):
 
 - **Stop** (running row): kills the model call and every process it started, and marks the row `stopped`. A stop that arrives between steps takes effect before the next step, so nothing is posted after it.
-- **Re-review** (history row): queues a fresh review of that MR/PR, rebuilt from the row's URL. It skips the "already reviewed" and same-head guards, and carries the bot's open findings like a push re-review. A merged or closed MR is refused.
+- **Re-review** (history row): queues a fresh review of that MR/PR, rebuilt from the row's URL. It skips the "already reviewed" and same-head guards, and carries the bot's open findings like any requested re-review. A merged or closed MR is refused.
 - **Delete** (history row): removes the record from the page and from `REVIEW_STORE`. A running review must be stopped first.
 
 The same actions are plain HTTP for scripts: `POST /api/reviews/<id>/stop|rereview|delete` with `X-Dashboard: 1`.

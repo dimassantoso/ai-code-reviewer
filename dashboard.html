@@ -5,311 +5,581 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AI Code Reviewer</title>
 <style>
-  /* Monitor surface: density and glanceability, no marketing framing.
-     One accent (amber) means "in flight"; green/red are reserved for outcomes. */
+  /* Ops monitor: dense, glanceable, quiet chrome. The data is the only loud thing.
+     Blue = in flight. Status colors (good / warning / critical) only mark outcomes,
+     and always travel with an icon and a word, never color alone. */
   :root {
-    --bg:#0b0d10; --panel:#11141a; --panel-2:#151922; --line:#1f242e;
-    --fg:#e7eaf0; --dim:#8a93a1; --faint:#737c8b;
-    --live:#e0a75e; --ok:#5cb870; --bad:#e0574f;
+    color-scheme: light;
+    --bg:#f4f4f2; --surface:#fcfcfb; --surface-2:#f0efec; --line:#e2e1dc; --line-2:#d3d2cc;
+    --ink:#0b0b0b; --ink-2:#52514e; --ink-3:#6e6d68;
+    --accent:#1c5cab; --accent-wash:rgba(42,120,214,.10); --bar:#6da7ec; --bar-now:#1c5cab;
+    --good:#0a7d0a; --warn:#865a00; --bad:#c53030;
+    --good-wash:rgba(12,163,12,.10); --warn-wash:rgba(250,178,25,.16); --bad-wash:rgba(208,59,59,.10);
+    --shadow:0 1px 2px rgba(0,0,0,.04);
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
   }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --bg:#121211; --surface:#1a1a19; --surface-2:#222220; --line:#2b2b29; --line-2:#383835;
+      --ink:#f0efec; --ink-2:#c3c2b7; --ink-3:#9a998f;
+      --accent:#3987e5; --accent-wash:rgba(57,135,229,.14); --bar:#2a78d6; --bar-now:#86b6ef;
+      --good:#2bb52b; --warn:#fab219; --bad:#e66767;
+      --good-wash:rgba(12,163,12,.14); --warn-wash:rgba(250,178,25,.12); --bad-wash:rgba(230,103,103,.13);
+      --shadow:none;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg:#121211; --surface:#1a1a19; --surface-2:#222220; --line:#2b2b29; --line-2:#383835;
+    --ink:#f0efec; --ink-2:#c3c2b7; --ink-3:#9a998f;
+    --accent:#3987e5; --accent-wash:rgba(57,135,229,.14); --bar:#2a78d6; --bar-now:#86b6ef;
+    --good:#2bb52b; --warn:#fab219; --bad:#e66767;
+    --good-wash:rgba(12,163,12,.14); --warn-wash:rgba(250,178,25,.12); --bad-wash:rgba(230,103,103,.13);
+    --shadow:none;
+  }
+
   * { box-sizing:border-box; }
-  body { margin:0; padding:22px 26px 40px; background:var(--bg); color:var(--fg);
-         font:13px/1.5 -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
-         font-variant-numeric: tabular-nums; }
-  .wrap { max-width:1180px; margin:0 auto; }
+  html, body { background:var(--bg); }
+  body { margin:0; padding:20px 24px 48px; color:var(--ink); font:13px/1.5 var(--sans); }
+  .wrap { max-width:1200px; margin:0 auto; }
+  .num, td.num, th.num, .tab { font-variant-numeric:tabular-nums; }
+  button, input, select { font:inherit; color:inherit; }
+  :focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  .sr { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; }
 
-  header { display:flex; align-items:baseline; justify-content:space-between;
-           gap:16px; flex-wrap:wrap; padding-bottom:14px; border-bottom:1px solid var(--line); }
-  h1 { font:600 13px/1.4 var(--mono); letter-spacing:.14em; text-transform:uppercase;
-       margin:0; color:var(--fg); }
-  .conn { display:flex; align-items:center; gap:7px; color:var(--dim); font-size:11.5px; }
-  .dot { width:6px; height:6px; border-radius:50%; background:var(--live); flex:none; }
-  .conn.stale .dot { background:var(--faint); }
-  #stamp { color:var(--faint); font-size:11px; }
+  /* Header */
+  header { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+  .brand { display:flex; align-items:center; gap:10px; }
+  .brand h1 { font:600 15px/1.2 var(--sans); margin:0; letter-spacing:-.005em; }
+  .conn { display:inline-flex; align-items:center; gap:6px; color:var(--ink-3); font-size:12px; }
+  .conn i { width:7px; height:7px; border-radius:50%; background:var(--good); }
+  .conn.stale i { background:var(--ink-3); }
+  .hright { display:flex; align-items:center; gap:10px; color:var(--ink-3); font-size:12px; }
+  .iconbtn { display:inline-grid; place-items:center; width:30px; height:30px; padding:0; cursor:pointer;
+             background:var(--surface); border:1px solid var(--line); border-radius:6px; color:var(--ink-2); }
+  .iconbtn:hover { border-color:var(--line-2); color:var(--ink); }
 
-  h2 { font:600 10px/1 var(--mono); letter-spacing:.1em; text-transform:uppercase;
-       color:var(--dim); margin:0; }
+  /* Filter row: one row, above everything it scopes */
+  .filters { display:flex; flex-wrap:wrap; align-items:center; gap:8px; margin:16px 0 12px; }
+  .seg { display:inline-flex; background:var(--surface); border:1px solid var(--line); border-radius:6px; padding:2px; }
+  .seg button { border:0; background:transparent; padding:4px 10px; border-radius:4px; cursor:pointer; color:var(--ink-2); }
+  .seg button[aria-pressed="true"] { background:var(--surface-2); color:var(--ink); font-weight:600; }
+  .filters select, .filters input { height:32px; padding:0 10px; background:var(--surface); border:1px solid var(--line);
+                                    border-radius:6px; color:var(--ink); }
+  .filters input { width:220px; }
+  .filters .grow { flex:1; }
+  .filters .scope { color:var(--ink-3); font-size:12px; }
 
-  /* Metrics rail: one panel, hierarchy by weight and size, not eight equal boxes. */
-  .strip { display:flex; flex-wrap:wrap; align-items:stretch; gap:0;
-           background:var(--panel); border:1px solid var(--line); border-radius:6px;
-           margin:16px 0 0; overflow:hidden; }
-  .lead { padding:12px 16px; border-right:1px solid var(--line); min-width:132px; }
-  .lead .k { display:block; color:var(--dim); font:600 10px/1 var(--mono);
-             letter-spacing:.1em; text-transform:uppercase; }
-  .lead .v { display:block; font-size:26px; font-weight:600; letter-spacing:-.02em; line-height:1.15; margin-top:5px; }
-  .lead .note { color:var(--faint); font-size:11px; }
-  .rail { display:grid; grid-template-columns:repeat(auto-fit,minmax(88px,1fr));
-          flex:1; min-width:0; }
-  .rail > div { padding:12px 14px; border-right:1px solid var(--line); }
-  .rail > div:last-child { border-right:0; }
-  .rail .k { display:block; color:var(--dim); font:600 10px/1 var(--mono);
-             letter-spacing:.1em; text-transform:uppercase; white-space:nowrap; }
-  .rail .v { display:block; font-size:15px; font-weight:600; margin-top:5px; }
-  .v.ok { color:var(--ok); } .v.bad { color:var(--bad); } .v.live-v { color:var(--live); }
+  /* KPI row: one hero figure, then stat tiles */
+  .kpis { display:grid; grid-template-columns:minmax(220px,1.4fr) repeat(4,minmax(110px,1fr)); gap:1px;
+          background:var(--line); border:1px solid var(--line); border-radius:8px; overflow:hidden; box-shadow:var(--shadow); }
+  .tile { background:var(--surface); padding:12px 14px; min-width:0; }
+  .tile .k { color:var(--ink-3); font-size:12px; }
+  .tile .v { font-size:20px; font-weight:600; letter-spacing:-.01em; margin-top:2px; }
+  .tile .s { color:var(--ink-3); font-size:11.5px; margin-top:1px; }
+  .tile.hero { grid-row:span 2; display:flex; flex-direction:column; justify-content:space-between; }
+  .tile.hero .v { font-size:52px; line-height:1.05; letter-spacing:-.03em; }
+  .tile.hero svg { display:block; width:100%; height:34px; margin-top:8px; }
+  .live-v { color:var(--accent); }
 
+  /* Cards */
+  section { margin-top:18px; }
+  .card { background:var(--surface); border:1px solid var(--line); border-radius:8px; box-shadow:var(--shadow); }
+  .cardhead { display:flex; align-items:baseline; justify-content:space-between; gap:12px; padding:12px 14px 0; }
+  .cardhead h2 { font:600 13px/1.3 var(--sans); margin:0; }
+  .cardhead .note { color:var(--ink-3); font-size:12px; }
 
-  section { margin-top:26px; }
-  .sechead { display:flex; align-items:baseline; justify-content:space-between;
-             gap:12px; margin-bottom:8px; }
-  .note { color:var(--faint); font-size:11px; }
+  /* Daily chart: single series, columns <=24px, rounded data end, hover per column */
+  .chart { position:relative; padding:8px 14px 10px; }
+  .chart svg { display:block; width:100%; height:150px; overflow:visible; }
+  .chart .grid line { stroke:var(--line); stroke-width:1; }
+  .chart .tick { fill:var(--ink-3); font-size:11px; font-variant-numeric:tabular-nums; }
+  .chart .col { fill:var(--bar); }
+  .chart .col.now { fill:var(--bar-now); }
+  .chart .hit { fill:transparent; cursor:default; }
+  .chart .hit:hover + .col, .chart .hit:focus + .col { fill:var(--accent); }
+  .chart .hit:focus { outline:none; }
+  .chart .hit:focus-visible { stroke:var(--accent); stroke-width:1; }
+  .tip { position:absolute; pointer-events:none; z-index:5; min-width:150px; padding:8px 10px; border-radius:6px;
+         background:var(--surface); border:1px solid var(--line-2); box-shadow:0 4px 14px rgba(0,0,0,.12);
+         font-size:12px; opacity:0; transform:translateY(2px); transition:opacity .12s, transform .12s; }
+  .tip.on { opacity:1; transform:none; }
+  .tip b { font-size:15px; font-weight:600; }
+  .tip .d { color:var(--ink-3); margin-bottom:4px; }
+  .tip .row { display:flex; justify-content:space-between; gap:14px; color:var(--ink-2); }
 
-  .tbl { border:1px solid var(--line); border-radius:6px; background:var(--panel); overflow:auto; }
+  /* Tables */
+  .tbl { overflow:auto; }
   table { width:100%; border-collapse:separate; border-spacing:0; font-size:12.5px; }
-  thead th { position:sticky; top:0; z-index:1; background:var(--panel-2);
-             color:#9aa3af; font:600 10.5px/1 var(--mono); letter-spacing:.09em;
-             text-transform:uppercase; text-align:left; padding:8px 12px;
-             border-bottom:1px solid var(--line); white-space:nowrap; }
-  tbody td { padding:7px 12px; border-bottom:1px solid var(--line); vertical-align:middle; }
+  thead th { position:sticky; top:0; z-index:1; background:var(--surface); color:var(--ink-3); font-weight:500;
+             font-size:12px; text-align:left; padding:10px 10px 8px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  tbody td { padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:middle; }
   tbody tr:last-child td { border-bottom:0; }
-  tbody tr:hover { background:rgba(255,255,255,.018); }
-  td.nowrap, th.nowrap { white-space:nowrap; }
-  td.num { text-align:right; }
-  th.num { text-align:right; }
-  .empty { color:var(--faint); padding:16px 12px !important; font-size:12px; }
-  .sr { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); }
-
+  tbody tr.row { cursor:pointer; }
+  tbody tr.row:hover, tbody tr.row.open { background:var(--surface-2); }
+  th.num, td.num { text-align:right; }
+  .nowrap { white-space:nowrap; }
+  .empty { color:var(--ink-3); padding:22px 12px !important; text-align:center; cursor:default; }
   .mono { font-family:var(--mono); font-size:12px; }
-  a { color:var(--fg); text-decoration:none; border-bottom:1px solid var(--line); }
-  a:hover { border-bottom-color:var(--dim); }
-  .dim { color:var(--dim); }
+  a { color:inherit; text-decoration:none; border-bottom:1px solid var(--line-2); }
+  a:hover { border-bottom-color:var(--ink-2); }
+  .dim { color:var(--ink-2); } .faint { color:var(--ink-3); }
 
-  .pill { display:inline-block; padding:1px 6px; border-radius:3px; font:600 10px/1.6 var(--mono);
-          letter-spacing:.06em; text-transform:uppercase; white-space:nowrap; }
-  .pill.done { color:var(--ok); background:rgba(92,184,112,.12); }
-  .pill.failed { color:var(--bad); background:rgba(224,87,79,.12); }
-  .pill.skipped { color:var(--dim); background:rgba(138,147,161,.1); }
-  .pill.running { color:var(--live); background:rgba(224,167,94,.12); }
-  .pill.stopped { color:var(--live); background:rgba(224,167,94,.08); }
-  .pill.APPROVE { color:var(--ok); background:rgba(92,184,112,.12); }
-  .pill.REQUEST_CHANGES { color:var(--bad); background:rgba(224,87,79,.12); }
-  .stage { display:inline-flex; align-items:center; gap:6px; color:var(--dim); font-size:12px; }
-  .stage i { width:5px; height:5px; border-radius:50%; background:var(--live); }
-  @media (prefers-reduced-motion: no-preference) {
-    .stage i { animation:pulse 1.6s ease-in-out infinite; }
-    @keyframes pulse { 50% { opacity:.25; } }
-  }
-  .bar { height:3px; background:var(--line); border-radius:2px; overflow:hidden; min-width:80px; }
-  .bar > i { display:block; height:100%; background:var(--live); transition:width .4s ease; }
+  .badge { display:inline-flex; align-items:center; gap:5px; padding:1px 7px 1px 6px; border-radius:999px;
+           font-size:11.5px; font-weight:600; white-space:nowrap; line-height:1.6; }
+  .badge svg { width:11px; height:11px; flex:none; }
+  .b-good { color:var(--good); background:var(--good-wash); }
+  .b-bad { color:var(--bad); background:var(--bad-wash); }
+  .b-warn { color:var(--warn); background:var(--warn-wash); }
+  .b-mute { color:var(--ink-2); background:var(--surface-2); }
+  .b-live { color:var(--accent); background:var(--accent-wash); }
 
-  .remark { color:var(--dim); font-size:11.5px; max-width:340px; overflow:hidden;
-            text-overflow:ellipsis; white-space:nowrap; }
+  .remark { display:block; color:var(--ink-2); max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .remark.bad { color:var(--bad); }
+  .detail td { background:var(--surface-2); padding:10px 12px 14px; cursor:default; }
+  .detail dl { display:grid; grid-template-columns:max-content 1fr; gap:4px 16px; margin:0; font-size:12.5px; }
+  .detail dt { color:var(--ink-3); }
+  .detail dd { margin:0; white-space:pre-wrap; word-break:break-word; }
 
-  .foot { display:flex; align-items:center; justify-content:flex-end; gap:10px;
-          margin-top:8px; color:var(--dim); font-size:11px; }
-  .foot button { font:inherit; padding:3px 9px; cursor:pointer; color:var(--dim);
-                 background:transparent; border:1px solid var(--line); border-radius:4px; }
-  .foot button:hover:not(:disabled) { color:var(--fg); border-color:var(--dim); }
-  .foot button:disabled { opacity:.3; cursor:default; }
-  button:focus-visible, a:focus-visible { outline:1px solid var(--live); outline-offset:2px; }
+  /* Live stage tracker */
+  .steps { display:inline-flex; align-items:center; gap:4px; }
+  .steps i { width:18px; height:4px; border-radius:2px; background:var(--line-2); }
+  .steps i.done { background:var(--accent); }
+  .steps i.cur { background:var(--accent); }
+  @media (prefers-reduced-motion: no-preference) {
+    .steps i.cur { animation:pulse 1.4s ease-in-out infinite; }
+    @keyframes pulse { 50% { opacity:.35; } }
+  }
+  .stage { color:var(--ink-2); margin-left:8px; }
 
-  /* Row actions: quiet until hovered; destructive ones turn red on hover only. */
+  /* Row actions: visible, quiet; destructive ones turn red on hover only */
   td.acts { white-space:nowrap; text-align:right; }
-  .act { font:600 10px/1.6 var(--mono); letter-spacing:.06em; text-transform:uppercase;
-         padding:2px 7px; margin-left:4px; cursor:pointer; color:var(--dim);
-         background:transparent; border:1px solid var(--line); border-radius:3px; }
-  .act:hover:not(:disabled) { color:var(--fg); border-color:var(--dim); }
+  .act { padding:3px 9px; margin-left:4px; cursor:pointer; font-size:12px; color:var(--ink-2);
+         background:var(--surface); border:1px solid var(--line); border-radius:5px; }
+  .act:hover:not(:disabled) { color:var(--ink); border-color:var(--line-2); }
   .act.danger:hover:not(:disabled) { color:var(--bad); border-color:var(--bad); }
-  .act:disabled { opacity:.35; cursor:default; }
-  #flash { min-height:16px; font-size:11.5px; color:var(--dim); margin-top:10px; }
-  #flash.bad { color:var(--bad); }
+  .act:disabled { opacity:.4; cursor:default; }
 
-  @media (max-width:640px) {
-    body { padding:16px 14px 32px; }
-    .lead { border-right:0; border-bottom:1px solid var(--line); flex:1 0 100%; }
+  .foot { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:10px 14px;
+          border-top:1px solid var(--line); color:var(--ink-3); font-size:12px; }
+  .pager { display:flex; align-items:center; gap:8px; }
+  .pager button { padding:3px 10px; cursor:pointer; background:var(--surface); border:1px solid var(--line);
+                  border-radius:5px; color:var(--ink-2); }
+  .pager button:disabled { opacity:.4; cursor:default; }
+
+  .toast { position:fixed; left:50%; bottom:20px; transform:translate(-50%,12px); opacity:0; z-index:20;
+           padding:8px 14px; border-radius:6px; background:var(--ink); color:var(--surface); font-size:12.5px;
+           transition:opacity .15s, transform .15s; pointer-events:none; max-width:min(90vw,560px); }
+  .toast.on { opacity:1; transform:translate(-50%,0); }
+  .toast.bad { background:var(--bad); color:#fff; }
+
+  @media (max-width:900px) {
+    .kpis { grid-template-columns:repeat(2,minmax(0,1fr)); }
+    .tile.hero { grid-row:auto; grid-column:1 / -1; }
+    .filters input { width:100%; }
+    .filters .grow { display:none; }
+  }
+  @media (max-width:560px) {
+    body { padding:14px 16px 40px; }
+    .hide-sm { display:none; }
   }
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
-    <h1>AI Code Reviewer</h1>
-    <div class="conn" id="conn" aria-live="polite">
-      <span class="dot"></span><span id="conn-text">connecting…</span>
-      <span id="stamp"></span>
+    <div class="brand">
+      <h1>AI Code Reviewer</h1>
+      <span class="conn stale" id="conn" aria-live="polite"><i></i><span id="conn-text">connecting…</span></span>
+    </div>
+    <div class="hright">
+      <span id="workers" class="hide-sm"></span>
+      <button class="iconbtn" id="theme" type="button" aria-label="Toggle light or dark theme" title="Theme">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+      </button>
     </div>
   </header>
 
-  <div class="strip">
-    <div class="lead">
-      <span class="k">Today</span>
-      <span class="v" id="s-today">–</span>
-      <span class="note">of <b id="s-total">–</b> all time</span>
+  <div class="filters" role="group" aria-label="Filters">
+    <div class="seg" id="range" role="group" aria-label="Time range">
+      <button type="button" data-r="1">Today</button>
+      <button type="button" data-r="7">7 days</button>
+      <button type="button" data-r="30">30 days</button>
+      <button type="button" data-r="0">All</button>
     </div>
-    <div class="rail">
-      <div><span class="k">Running</span><span class="v live-v" id="s-running">–</span></div>
-      <div><span class="k">Queued</span><span class="v" id="s-queued">–</span></div>
-      <div><span class="k">Approved</span><span class="v ok" id="s-approve">–</span></div>
-      <div><span class="k">Failed</span><span class="v bad" id="s-failed">–</span></div>
-      <div><span class="k">Avg</span><span class="v" id="s-avg">–</span></div>
-      <div><span class="k">p95</span><span class="v" id="s-p95">–</span></div>
-      <div title="Findings the reviewer conceded were wrong; fed back into later reviews">
-        <span class="k">Mistakes</span><span class="v" id="s-mistakes">–</span></div>
-    </div>
+    <label class="sr" for="status">Status</label>
+    <select id="status">
+      <option value="!skipped">Hide skipped</option>
+      <option value="">All statuses</option>
+      <option value="done">Done</option>
+      <option value="failed">Failed</option>
+      <option value="skipped">Skipped</option>
+      <option value="stopped">Stopped</option>
+    </select>
+    <label class="sr" for="q">Search</label>
+    <input id="q" type="search" placeholder="Search repo, author, remark" autocomplete="off">
+    <span class="grow"></span>
+    <span class="scope" id="scope"></span>
   </div>
 
-  <section>
-    <div class="sechead"><h2>Now</h2><span class="note" id="live-note"></span></div>
-    <div class="tbl">
-      <table>
-        <thead><tr>
-          <th scope="col">Target</th><th scope="col">MR author</th><th scope="col">Platform</th>
-          <th scope="col">Stage</th><th scope="col" class="num">Elapsed</th>
-          <th scope="col" style="width:22%">Progress</th><th scope="col"><span class="sr">Actions</span></th>
-        </tr></thead>
-        <tbody id="live"><tr><td colspan="7" class="empty">idle — waiting for a webhook</td></tr></tbody>
-      </table>
+  <div class="kpis">
+    <div class="tile hero">
+      <div>
+        <div class="k" id="hero-k">Reviews</div>
+        <div class="v" id="hero-v">–</div>
+        <div class="s" id="hero-s">&nbsp;</div>
+      </div>
+      <svg id="spark" viewBox="0 0 280 34" preserveAspectRatio="none" aria-hidden="true"></svg>
+    </div>
+    <div class="tile"><div class="k">Running</div><div class="v live-v" id="k-running">–</div><div class="s" id="k-queued">&nbsp;</div></div>
+    <div class="tile"><div class="k">Approval rate</div><div class="v" id="k-rate">–</div><div class="s" id="k-rate-s">&nbsp;</div></div>
+    <div class="tile"><div class="k">Failed</div><div class="v" id="k-failed">–</div><div class="s" id="k-failed-s">&nbsp;</div></div>
+    <div class="tile"><div class="k">Avg duration</div><div class="v" id="k-avg">–</div><div class="s" id="k-p95">&nbsp;</div></div>
+    <div class="tile"><div class="k">Inline comments</div><div class="v" id="k-inline">–</div><div class="s">posted on diffs</div></div>
+    <div class="tile"><div class="k">Skipped</div><div class="v" id="k-skipped">–</div><div class="s">not reviewable</div></div>
+    <div class="tile" title="Findings the reviewer conceded were wrong; fed back into later reviews">
+      <div class="k">Lessons learned</div><div class="v" id="k-mistakes">–</div><div class="s">conceded findings</div></div>
+    <div class="tile"><div class="k">Stopped</div><div class="v" id="k-stopped">–</div><div class="s">from the dashboard</div></div>
+  </div>
+
+  <section class="card">
+    <div class="cardhead"><h2>Reviews per day</h2><span class="note" id="chart-note"></span></div>
+    <div class="chart" id="chart">
+      <svg id="cols" role="img" aria-label="Reviews per day"></svg>
+      <div class="tip" id="tip" role="tooltip"></div>
     </div>
   </section>
 
-  <section>
-    <div class="sechead"><h2>History</h2><span class="note" id="hist-note"></span></div>
+  <section class="card">
+    <div class="cardhead"><h2>In flight</h2><span class="note" id="live-note"></span></div>
     <div class="tbl">
       <table>
         <thead><tr>
-          <th scope="col" class="nowrap">When</th><th scope="col">Target</th><th scope="col">MR author</th>
-          <th scope="col">Verdict</th><th scope="col" class="num">Inline</th>
-          <th scope="col" class="num">Duration</th><th scope="col">Status</th><th scope="col">Remark</th>
+          <th scope="col">Target</th><th scope="col" class="hide-sm">Author</th>
+          <th scope="col">Stage</th><th scope="col" class="num">Elapsed</th>
           <th scope="col"><span class="sr">Actions</span></th>
         </tr></thead>
-        <tbody id="hist"><tr><td colspan="9" class="empty">no reviews yet</td></tr></tbody>
+        <tbody id="live"><tr><td colspan="5" class="empty">Idle — waiting for a webhook</td></tr></tbody>
       </table>
     </div>
-    <div class="foot" id="pager"></div>
-    <div id="flash" role="status" aria-live="polite"></div>
+  </section>
+
+  <section class="card">
+    <div class="cardhead"><h2>History</h2><span class="note" id="hist-note"></span></div>
+    <div class="tbl">
+      <table>
+        <thead><tr>
+          <th scope="col" class="nowrap">When</th><th scope="col">Target</th><th scope="col" class="hide-sm">Author</th>
+          <th scope="col">Verdict</th><th scope="col" class="num hide-sm">Inline</th>
+          <th scope="col" class="num">Duration</th><th scope="col">Status</th><th scope="col" class="hide-sm">Remark</th>
+          <th scope="col"><span class="sr">Actions</span></th>
+        </tr></thead>
+        <tbody id="hist"><tr><td colspan="9" class="empty">No reviews yet</td></tr></tbody>
+      </table>
+    </div>
+    <div class="foot"><span id="hist-count"></span><div class="pager" id="pager"></div></div>
   </section>
 </div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
 
 <script>
-const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const secs = n => n >= 60 ? Math.floor(n / 60) + "m " + Math.round(n % 60) + "s" : (n || 0).toFixed(1) + "s";
-// Show the short target ("group/project!12") and keep the full URL in the href
-// and the tooltip: repeating the host and the /merge_requests/ path on every row
-// costs the widest column in the table and tells nobody anything.
+"use strict";
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const store = {  // per-viewer conveniences only; the page works without storage
+  get(k, d) { try { const v = localStorage.getItem("acr." + k); return v === null ? d : JSON.parse(v); } catch (_) { return d; } },
+  set(k, v) { try { localStorage.setItem("acr." + k, JSON.stringify(v)); } catch (_) {} },
+};
+const DAY = 86400;
+const fmtInt = n => Number(n || 0).toLocaleString();
+const secs = n => !n ? "–" : n >= 60 ? Math.floor(n / 60) + "m " + String(Math.round(n % 60)).padStart(2, "0") + "s" : n.toFixed(1) + "s";
+const ago = t => {
+  const d = Math.max(0, Date.now() / 1000 - t);
+  if (d < 45) return "just now";
+  if (d < 3600) return Math.round(d / 60) + "m ago";
+  if (d < DAY) return Math.round(d / 3600) + "h ago";
+  if (d < 7 * DAY) return Math.round(d / DAY) + "d ago";
+  return new Date(t * 1000).toLocaleDateString(undefined, {month: "short", day: "numeric"});
+};
+const stamp = t => new Date(t * 1000).toLocaleString();
+const startOfDay = (t = Date.now() / 1000) => { const d = new Date(t * 1000); d.setHours(0, 0, 0, 0); return d.getTime() / 1000; };
 const link = (label, url) => {
   const name = label && label !== "?" ? label : (url || "").replace(/^https:\/\/[^/]+\//, "");
   return url && /^https:\/\//.test(url)
-    ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer" title="${esc(url)}">${esc(name || url)}</a>`
+    ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer" title="${esc(url)}" data-stop>${esc(name || url)}</a>`
     : esc(name || "—");
 };
-// History is paged in the browser: the snapshot already carries every record
-// (up to the store's limit), so paging costs no extra request.
+
+// Status: icon + word + color, never color alone.
+const ICON = {
+  check: '<svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 6.2l2.3 2.3 4.7-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  cross: '<svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 3l6 6M9 3l-6 6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>',
+  square: '<svg viewBox="0 0 12 12" aria-hidden="true"><rect x="3" y="3" width="6" height="6" rx="1" fill="currentColor"/></svg>',
+  dash: '<svg viewBox="0 0 12 12" aria-hidden="true"><path d="M3 6h6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>',
+  dot: '<svg viewBox="0 0 12 12" aria-hidden="true"><circle cx="6" cy="6" r="3" fill="currentColor"/></svg>',
+};
+const STATUS = {
+  done: ["b-good", "check", "Done"], failed: ["b-bad", "cross", "Failed"], stopped: ["b-warn", "square", "Stopped"],
+  skipped: ["b-mute", "dash", "Skipped"], running: ["b-live", "dot", "Running"],
+};
+const VERDICT = { APPROVE: ["b-good", "check", "Approved"], REQUEST_CHANGES: ["b-bad", "cross", "Changes requested"] };
+const badge = ([cls, icon, word]) => `<span class="badge ${cls}">${ICON[icon]}${esc(word)}</span>`;
+const statusBadge = s => badge(STATUS[s] || ["b-mute", "dash", s || "—"]);
+const verdictBadge = v => v ? badge(VERDICT[v] || ["b-mute", "dash", v]) : '<span class="faint">–</span>';
+
+// ---- state ------------------------------------------------------------------
 const PAGE = 25;
-let page = 0;
-let rows = [];
-let last = null;  // latest snapshot, so paging redraws without waiting for the next push
-const when = t => new Date(t * 1000).toLocaleString(undefined,
-  {month:"short", day:"numeric", hour:"2-digit", minute:"2-digit"});
+const state = {
+  range: store.get("range", 7), status: store.get("status", "!skipped"), q: "",
+  page: 0, open: null, last: null,
+};
 
-function render(d) {
-    last = d;
-    const s = d.stats;
-    document.getElementById("conn-text").textContent =
-      s.workers + " workers · " + s.inline + " inline comments · live";
-    document.getElementById("conn").classList.remove("stale");
-    document.getElementById("stamp").textContent = new Date().toLocaleTimeString();
-    const set = (id, v, cls) => {
-      const e = document.getElementById(id);
-      e.textContent = v;
-      if (cls) e.className = "v " + cls;
-    };
-    set("s-total", s.total); set("s-today", s.today); set("s-running", s.running, "live-v");
-    set("s-queued", s.queued); set("s-avg", s.avg ? secs(s.avg) : "–");
-    set("s-p95", s.p95 ? secs(s.p95) : "–"); set("s-approve", s.verdicts.APPROVE || 0, "ok");
-    set("s-failed", s.failed, "bad");
-    set("s-mistakes", s.mistakes ?? 0);
+// ---- theme --------------------------------------------------------------------
+function applyTheme(t) { if (t) document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme; }
+applyTheme(store.get("theme", null));
+$("theme").addEventListener("click", () => {
+  const dark = getComputedStyle(document.documentElement).colorScheme.includes("dark");
+  const next = dark ? "light" : "dark";
+  applyTheme(next); store.set("theme", next);
+  if (state.last) render(state.last);
+});
 
-    document.getElementById("live-note").textContent = d.live.length
-      ? d.live.length + " in flight" : "";
-    document.getElementById("live").innerHTML = d.live.length ? d.live.map(j => `<tr>
-      <td class="mono">${link(j.target, j.url)}</td><td class="dim">${esc(j.author) || "–"}</td>
-      <td class="dim">${esc(j.platform)}</td>
-      <td><span class="stage"><i></i>${esc(j.stage)}</span></td>
-      <td class="num">${secs(j.elapsed)}</td>
-      <td><div class="bar"><i style="width:${j.pct}%"></i></div></td>
-      <td class="acts"><button class="act danger" data-act="stop" data-id="${j.id}"
-        data-label="${esc(j.target)}" title="Stop this review">stop</button></td></tr>`).join("")
-      : '<tr><td colspan="7" class="empty">idle — waiting for a webhook</td></tr>';
+// ---- filters ------------------------------------------------------------------
+function syncFilters() {
+  document.querySelectorAll("#range button").forEach(b => b.setAttribute("aria-pressed", String(+b.dataset.r === state.range)));
+  $("status").value = state.status;
+}
+$("range").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return;
+  state.range = +b.dataset.r; state.page = 0; store.set("range", state.range); syncFilters(); rerender();
+});
+$("status").addEventListener("change", e => { state.status = e.target.value; state.page = 0; store.set("status", state.status); rerender(); });
+let qTimer;
+$("q").addEventListener("input", e => { clearTimeout(qTimer); qTimer = setTimeout(() => { state.q = e.target.value.trim().toLowerCase(); state.page = 0; rerender(); }, 120); });
+syncFilters();
+const rerender = () => state.last && render(state.last);
 
-    rows = d.history;
-    document.getElementById("hist-note").textContent = rows.length
-      ? rows.length + " recorded" : "";
-    const pages = Math.max(1, Math.ceil(rows.length / PAGE));
-    if (page >= pages) page = pages - 1;
-    const from = page * PAGE, slice = rows.slice(from, from + PAGE);
-    document.getElementById("pager").innerHTML = rows.length > PAGE
-      ? `<button ${page ? "" : "disabled"} data-p="-1">‹ prev</button>
-         <span>${from + 1}–${from + slice.length} of ${rows.length}</span>
-         <button ${page < pages - 1 ? "" : "disabled"} data-p="1">next ›</button>`
-      : "";
-    document.getElementById("hist").innerHTML = slice.length ? slice.map(h => {
-      const why = h.error || h.remark || "";
-      return `<tr>
-      <td class="num nowrap dim">${when(h.started)}</td><td class="mono">${link(h.target, h.url)}</td>
-      <td class="dim">${esc(h.author) || "–"}</td>
-      <td>${h.verdict ? `<span class="pill ${esc(h.verdict)}">${esc(h.verdict)}</span>` : "–"}</td>
-      <td class="num">${h.inline || 0}</td><td class="num dim">${secs(h.duration)}</td>
-      <td><span class="pill ${esc(h.status)}">${esc(h.status)}</span></td>
-      <td class="remark ${h.error ? "bad" : ""}" title="${esc(why)}">${esc(why)}</td>
-      <td class="acts">
-        <button class="act" data-act="rereview" data-id="${h.id}" data-label="${esc(h.target)}"
-          ${h.url ? "" : "disabled"} title="Review this MR/PR again now">re-review</button>
-        <button class="act danger" data-act="delete" data-id="${h.id}" data-label="${esc(h.target)}"
-          title="Delete this record from history">delete</button></td></tr>`;
-    }).join("")
-      : '<tr><td colspan="9" class="empty">no reviews yet</td></tr>';
+function inRange(r, now) { return !state.range || (r.started || 0) >= startOfDay(now) - (state.range - 1) * DAY; }
+function matches(r) {
+  if (state.status === "!skipped" ? r.status === "skipped" : state.status && r.status !== state.status) return false;
+  if (!state.q) return true;
+  return [r.target, r.author, r.remark, r.error, r.verdict, r.platform].some(v => String(v || "").toLowerCase().includes(state.q));
 }
 
-// One delegated listener: the pager buttons are rebuilt on every render.
-document.addEventListener("click", e => {
-  const b = e.target.closest("#pager button");
-  if (!b || b.disabled) return;
-  page = Math.max(0, page + Number(b.dataset.p));
-  if (last) render(last);
-});
-// Row actions. The server re-pushes the snapshot on every change, so a
-// successful action needs no local bookkeeping: the row updates itself.
+// ---- KPIs ---------------------------------------------------------------------
+function pct(sorted, p) { return sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p / 100))] : 0; }
+function renderKpis(d, rows, now, ranged) {
+  const label = {1: "Reviews today", 7: "Reviews, last 7 days", 30: "Reviews, last 30 days", 0: "Reviews, all time"}[state.range];
+  const reviewed = rows.filter(r => r.verdict);
+  const approved = reviewed.filter(r => r.verdict === "APPROVE").length;
+  const durations = rows.filter(r => r.duration && r.status === "done").map(r => r.duration).sort((a, b) => a - b);
+  const count = s => rows.filter(r => r.status === s).length;
+  $("hero-k").textContent = label;
+  $("hero-v").textContent = fmtInt(rows.length);
+  $("hero-s").textContent = reviewed.length ? `${fmtInt(reviewed.length)} with a verdict · ${fmtInt(d.stats.total)} all time` : `${fmtInt(d.stats.total)} all time`;
+  $("k-running").textContent = fmtInt(d.stats.running);
+  $("k-queued").textContent = d.stats.queued ? `${fmtInt(d.stats.queued)} queued` : "queue empty";
+  $("k-rate").textContent = reviewed.length ? Math.round(100 * approved / reviewed.length) + "%" : "–";
+  $("k-rate-s").textContent = reviewed.length ? `${fmtInt(approved)} of ${fmtInt(reviewed.length)} approved` : "no verdicts in range";
+  const failed = count("failed");
+  $("k-failed").textContent = fmtInt(failed);
+  $("k-failed").style.color = failed ? "var(--bad)" : "";
+  $("k-failed-s").textContent = rows.length ? Math.round(100 * failed / rows.length) + "% of runs" : " ";
+  $("k-avg").textContent = durations.length ? secs(durations.reduce((a, b) => a + b, 0) / durations.length) : "–";
+  $("k-p95").textContent = durations.length ? `p95 ${secs(pct(durations, 95))}` : " ";
+  $("k-inline").textContent = fmtInt(rows.reduce((a, r) => a + (+r.inline || 0), 0));
+  $("k-skipped").textContent = fmtInt(ranged.filter(r => r.status === "skipped").length);
+  $("k-stopped").textContent = fmtInt(count("stopped"));
+  $("k-mistakes").textContent = fmtInt(d.stats.mistakes ?? 0);
+  $("workers").textContent = `${d.stats.workers} workers`;
+}
+
+// ---- daily series -------------------------------------------------------------
+function daily(rows, now) {
+  const days = state.range === 1 ? 14 : Math.min(Math.max(state.range || 30, 14), 30);
+  const today = startOfDay(now), out = [];
+  for (let i = days - 1; i >= 0; i--) out.push({t: today - i * DAY, n: 0, approve: 0, changes: 0, failed: 0, skipped: 0, stopped: 0});
+  const first = out[0].t;
+  for (const r of rows) {
+    const t = r.started || 0; if (t < first) continue;
+    const b = out[Math.min(out.length - 1, Math.floor((startOfDay(t) - first) / DAY + 0.5))];
+    if (!b) continue;
+    b.n++;
+    if (r.verdict === "APPROVE") b.approve++; else if (r.verdict === "REQUEST_CHANGES") b.changes++;
+    if (r.status in b) b[r.status]++;
+  }
+  return out;
+}
+const dayLabel = t => new Date(t * 1000).toLocaleDateString(undefined, {month: "short", day: "numeric"});
+const niceMax = m => { if (m <= 4) return 4; const p = Math.pow(10, Math.floor(Math.log10(m))); return Math.ceil(m / p / (m / p > 5 ? 2 : 1)) * p * (m / p > 5 ? 2 : 1); };
+
+function renderChart(series) {
+  const svg = $("cols"), W = svg.clientWidth || 800, H = 150, padL = 30, padB = 20, padT = 6;
+  const max = niceMax(Math.max(1, ...series.map(s => s.n)));
+  const plotW = W - padL, plotH = H - padB - padT, slot = plotW / series.length;
+  const bw = Math.min(24, Math.max(4, slot * 0.6));
+  const y = v => padT + plotH - (v / max) * plotH;
+  const ticks = [0, max / 2, max];
+  const labelEvery = Math.ceil(series.length / Math.max(1, Math.floor(plotW / 64)));
+  let g = `<g class="grid">${ticks.map(v => `<line x1="${padL}" x2="${W}" y1="${y(v)}" y2="${y(v)}"/>`).join("")}</g>`;
+  g += ticks.map(v => `<text class="tick" x="${padL - 6}" y="${y(v) + 4}" text-anchor="end">${fmtInt(v)}</text>`).join("");
+  series.forEach((s, i) => {
+    const cx = padL + slot * i + slot / 2, h = Math.max(0, plotH - (y(s.n) - padT));
+    const x = cx - bw / 2, top = padT + plotH - h, r = Math.min(4, h, bw / 2);
+    // Rounded data end, square at the baseline.
+    const path = h <= 0 ? "" : `M${x},${padT + plotH}V${top + r}Q${x},${top} ${x + r},${top}H${x + bw - r}Q${x + bw},${top} ${x + bw},${top + r}V${padT + plotH}Z`;
+    g += `<rect class="hit" x="${padL + slot * i}" y="${padT}" width="${slot}" height="${plotH}" tabindex="0" data-i="${i}"
+            aria-label="${esc(dayLabel(s.t))}: ${s.n} reviews"/>`;
+    g += `<path class="col${i === series.length - 1 ? " now" : ""}" d="${path}"/>`;
+    const last = series.length - 1;
+    if (i === last || (i % labelEvery === 0 && last - i >= labelEvery))
+      g += `<text class="tick" x="${cx}" y="${H - 4}" text-anchor="middle">${i === series.length - 1 ? "Today" : esc(dayLabel(s.t))}</text>`;
+  });
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.innerHTML = g;
+  svg._series = series;
+  const total = series.reduce((a, s) => a + s.n, 0);
+  $("chart-note").textContent = `${fmtInt(total)} in the last ${series.length} days`;
+}
+function showTip(target) {
+  const s = $("cols")._series?.[+target.dataset.i]; if (!s) return;
+  const tip = $("tip"), row = (k, v) => v ? `<div class="row"><span>${k}</span><span class="tab">${fmtInt(v)}</span></div>` : "";
+  tip.innerHTML = `<div class="d">${esc(dayLabel(s.t))}</div><b class="tab">${fmtInt(s.n)}</b> <span class="faint">reviews</span>` +
+    row("Approved", s.approve) + row("Changes requested", s.changes) + row("Failed", s.failed) +
+    row("Skipped", s.skipped) + row("Stopped", s.stopped);
+  const box = $("chart").getBoundingClientRect(), r = target.getBoundingClientRect();
+  const left = Math.min(box.width - 170, Math.max(4, r.left - box.left + r.width / 2 - 80));
+  tip.style.left = left + "px"; tip.style.top = "4px"; tip.classList.add("on");
+}
+const hideTip = () => $("tip").classList.remove("on");
+$("cols").addEventListener("pointerover", e => e.target.classList.contains("hit") && showTip(e.target));
+$("cols").addEventListener("focusin", e => e.target.classList.contains("hit") && showTip(e.target));
+$("cols").addEventListener("pointerleave", hideTip);
+$("cols").addEventListener("focusout", hideTip);
+let resizeTimer;
+window.addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(rerender, 150); });
+// Sparkline: same daily series, de-emphasis hue, today in the accent.
+function renderSpark(series) {
+  const max = Math.max(1, ...series.map(s => s.n)), w = 280 / series.length;
+  $("spark").innerHTML = series.map((s, i) => {
+    const h = Math.max(s.n ? 2 : 1, (s.n / max) * 32);
+    return `<rect x="${i * w + 1}" y="${34 - h}" width="${Math.max(1, w - 2)}" height="${h}" rx="1"
+             fill="${i === series.length - 1 ? "var(--bar-now)" : "var(--bar)"}" opacity="${s.n ? 1 : .5}"/>`;
+  }).join("");
+}
+
+// ---- live ---------------------------------------------------------------------
+const STAGES = ["queued", "collecting", "reviewing", "posting"];
+function renderLive(live) {
+  $("live-note").textContent = live.length ? `${live.length} running` : "";
+  $("live").innerHTML = live.length ? live.map(j => {
+    const at = Math.max(0, STAGES.indexOf(j.stage));
+    const steps = STAGES.map((s, i) => `<i class="${i < at ? "done" : i === at ? "cur" : ""}"></i>`).join("");
+    return `<tr><td class="mono">${link(j.target, j.url)}</td><td class="dim hide-sm">${esc(j.author) || "–"}</td>
+      <td class="nowrap"><span class="steps" role="img" aria-label="Stage ${at + 1} of 4: ${esc(j.stage)}">${steps}</span><span class="stage">${esc(j.stage)}</span></td>
+      <td class="num">${secs(j.elapsed)}</td>
+      <td class="acts"><button class="act danger" data-act="stop" data-id="${j.id}" data-label="${esc(j.target)}">Stop</button></td></tr>`;
+  }).join("") : '<tr><td colspan="5" class="empty">Idle — waiting for a webhook</td></tr>';
+}
+
+// ---- history ------------------------------------------------------------------
+function renderHistory(rows) {
+  const pages = Math.max(1, Math.ceil(rows.length / PAGE));
+  if (state.page >= pages) state.page = pages - 1;
+  const from = state.page * PAGE, slice = rows.slice(from, from + PAGE);
+  $("hist-note").textContent = state.status || state.q ? "filtered" : "";
+  $("hist-count").textContent = rows.length ? `${from + 1}–${from + slice.length} of ${fmtInt(rows.length)}` : "";
+  $("pager").innerHTML = rows.length > PAGE
+    ? `<button type="button" data-p="-1" ${state.page ? "" : "disabled"}>Previous</button>
+       <button type="button" data-p="1" ${state.page < pages - 1 ? "" : "disabled"}>Next</button>` : "";
+  $("hist").innerHTML = slice.length ? slice.map(h => {
+    const why = h.error || h.remark || "";
+    const open = state.open === h.id;
+    let html = `<tr class="row${open ? " open" : ""}" data-row="${h.id}" tabindex="0" aria-expanded="${open}">
+      <td class="nowrap faint" title="${esc(stamp(h.started))}">${esc(ago(h.started))}</td>
+      <td class="mono">${link(h.target, h.url)}</td><td class="dim hide-sm">${esc(h.author) || "–"}</td>
+      <td>${verdictBadge(h.verdict)}</td><td class="num hide-sm">${h.inline || 0}</td>
+      <td class="num dim">${secs(h.duration)}</td><td>${statusBadge(h.status)}</td>
+      <td class="hide-sm"><span class="remark ${h.error ? "bad" : ""}" title="${esc(why)}">${esc(why)}</span></td>
+      <td class="acts">
+        <button class="act" data-act="rereview" data-id="${h.id}" data-label="${esc(h.target)}" ${h.url ? "" : "disabled"}>Re-review</button>
+        <button class="act danger" data-act="delete" data-id="${h.id}" data-label="${esc(h.target)}">Delete</button></td></tr>`;
+    if (open) {
+      const item = (k, v) => v || v === 0 ? `<dt>${k}</dt><dd>${v}</dd>` : "";
+      html += `<tr class="detail"><td colspan="9"><dl>
+        ${item("Started", esc(stamp(h.started)))}${item("Platform", esc(h.platform))}
+        ${item("Target", link(h.target, h.url))}${item("Author", esc(h.author))}
+        ${item("Files", h.files)}${item("Inline comments", h.inline)}${item("Duration", secs(h.duration))}
+        ${h.error ? item("Error", `<span style="color:var(--bad)">${esc(h.error)}</span>`) : ""}
+        ${item("Remark", esc(h.remark))}</dl></td></tr>`;
+    }
+    return html;
+  }).join("") : `<tr><td colspan="9" class="empty">${state.status || state.q ? "Nothing matches these filters" : "No reviews in this range"}</td></tr>`;
+}
+
+function render(d) {
+  state.last = d;
+  const now = Date.now() / 1000;
+  $("conn").classList.remove("stale");
+  $("conn-text").textContent = "live";
+  const all = d.history || [];
+  const ranged = all.filter(r => inRange(r, now));
+  const rows = ranged.filter(matches);
+  $("scope").textContent = state.status || state.q ? `${fmtInt(rows.length)} of ${fmtInt(ranged.length)} match` : "";
+  renderKpis(d, rows, now, ranged);
+  const series = daily(all.filter(matches), now);
+  renderChart(series); renderSpark(series);
+  renderLive(d.live || []);
+  renderHistory(rows);
+}
+
+// ---- interactions ---------------------------------------------------------------
+function toast(text, bad) {
+  const t = $("toast"); t.textContent = text; t.className = "toast on" + (bad ? " bad" : "");
+  clearTimeout(toast.timer); toast.timer = setTimeout(() => t.classList.remove("on"), 4000);
+}
 const CONFIRM = {
   stop: l => `Stop the running review of ${l}? Nothing more will be posted.`,
   delete: l => `Delete the record for ${l}? This cannot be undone.`,
 };
-function flash(text, bad) {
-  const f = document.getElementById("flash");
-  f.textContent = text; f.className = bad ? "bad" : "";
-  clearTimeout(flash.t); flash.t = setTimeout(() => { f.textContent = ""; }, 6000);
-}
 document.addEventListener("click", async e => {
+  const pg = e.target.closest("#pager button");
+  if (pg) { state.page = Math.max(0, state.page + Number(pg.dataset.p)); return rerender(); }
   const b = e.target.closest("button.act");
-  if (!b || b.disabled) return;
-  const {act, id, label} = b.dataset;
-  if (CONFIRM[act] && !confirm(CONFIRM[act](label || "#" + id))) return;
-  b.disabled = true;
-  try {
-    const r = await fetch(`/api/reviews/${id}/${act}`,
-      {method: "POST", headers: {"X-Dashboard": "1"}, credentials: "same-origin"});
-    let msg = r.statusText;
-    try { msg = (await r.json()).message || msg; } catch (_) {}
-    flash(`${label || "#" + id}: ${msg}`, !r.ok);
-  } catch (err) {
-    flash("request failed: " + err, true);
-  } finally {
-    b.disabled = false;
+  if (b) {
+    if (b.disabled) return;
+    const {act, id, label} = b.dataset;
+    if (CONFIRM[act] && !confirm(CONFIRM[act](label || "#" + id))) return;
+    b.disabled = true;
+    try {
+      const r = await fetch(`/api/reviews/${id}/${act}`, {method: "POST", headers: {"X-Dashboard": "1"}, credentials: "same-origin"});
+      let msg = r.statusText;
+      try { msg = (await r.json()).message || msg; } catch (_) {}
+      toast(`${label || "#" + id}: ${msg}`, !r.ok);
+    } catch (err) { toast("Request failed: " + err, true); }
+    finally { b.disabled = false; }
+    return;
   }
+  if (e.target.closest("a")) return;  // links open the MR, not the row
+  const tr = e.target.closest("tr.row");
+  if (tr) { const id = +tr.dataset.row; state.open = state.open === id ? null : id; rerender(); }
 });
-// Server-Sent Events: the server pushes a snapshot on every change, so the page
-// idles between reviews instead of re-fetching the same JSON twice a second.
-// EventSource reconnects by itself; the poll is only a fallback for proxies that
-// strip streaming responses.
+document.addEventListener("keydown", e => {
+  const tr = e.target.closest && e.target.closest("tr.row");
+  if (tr && (e.key === "Enter" || e.key === " ") && e.target === tr) { e.preventDefault(); tr.click(); }
+});
+// Relative times drift: refresh labels every 30s without waiting for an event.
+setInterval(rerender, 30000);
+
+// ---- data: Server-Sent Events, with the snapshot endpoint as a first paint ----------
+fetch("/api/reviews", {credentials: "same-origin"}).then(r => r.ok ? r.json() : null).then(d => d && !state.last && render(d)).catch(() => {});
 let es;
 function connect() {
   es = new EventSource("/api/events");
   es.onmessage = e => { try { render(JSON.parse(e.data)); } catch (_) {} };
-  es.onerror = () => {
-    document.getElementById("conn-text").textContent = "reconnecting…";
-    document.getElementById("conn").classList.add("stale");
-  };
+  es.onerror = () => { $("conn-text").textContent = "reconnecting…"; $("conn").classList.add("stale"); };
 }
 connect();
 window.addEventListener("beforeunload", () => es && es.close());

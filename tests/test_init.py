@@ -32,7 +32,7 @@ class EnvFileTests(unittest.TestCase):
         parsed = init.parse_env(init.render_env(values))
         self.assertEqual(parsed["GITLAB_TOKEN"], "glpat-x")
         self.assertEqual(parsed["HERMES_UID"], "1000")
-        self.assertEqual(parsed["PUSH_DEBOUNCE_S"], "60")
+        self.assertEqual(parsed["MAX_WORKERS"], "4")
 
     def test_mask_hides_secrets_only(self):
         self.assertNotIn("supersecretvalue", init.mask("GITLAB_TOKEN", "supersecretvalue"))

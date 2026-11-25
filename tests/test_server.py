@@ -529,9 +529,9 @@ class TriggerFilterTests(unittest.TestCase):
         self.assertTrue(server.triggers_review("gitlab", "Note Hook", payload))
 
     def test_github_pr_actions(self):
-        for action in ("opened", "ready_for_review", "synchronize"):
+        for action in ("opened", "ready_for_review"):
             self.assertTrue(server.triggers_review("github", "pull_request", {"action": action}))
-        for action in ("reopened", "closed", "edited", "converted_to_draft"):
+        for action in ("synchronize", "reopened", "closed", "edited", "converted_to_draft", "review_requested"):
             self.assertFalse(server.triggers_review("github", "pull_request", {"action": action}), action)
         self.assertFalse(server.triggers_review("github", "push", {"action": "opened"}))
 
@@ -2326,104 +2326,104 @@ class ConcurrencyTests(unittest.TestCase):
             self.assertNotIn(key, server._seen, "failed review kept the dedupe claim")
 
 
-class PushReviewTests(unittest.TestCase):
-    """A push re-reviews; edits do not; a burst of pushes costs one review."""
+class ReviewRequestTests(unittest.TestCase):
+    """Reviews run on creation, ready, reviewer assignment or `@bot review`; never on a push."""
 
-    def gl(self, **attrs):
+    def setUp(self):
+        self.saved = server.BOT_USERNAME
+        server.BOT_USERNAME = "bot"
+
+    def tearDown(self):
+        server.BOT_USERNAME = self.saved
+
+    def gl(self, changes=None, **attrs):
         base = {"action": "update", "state": "opened", "iid": 1, "title": "feat"}
         base.update(attrs)
-        return {"object_kind": "merge_request", "project": {"id": 1}, "object_attributes": base}
+        payload = {"object_kind": "merge_request", "project": {"id": 1}, "object_attributes": base}
+        if changes is not None:
+            payload["changes"] = changes  # GitLab sends `changes` at the top level
+        return payload
 
-    def test_gitlab_push_triggers_but_edit_does_not(self):
-        self.assertTrue(server.triggers_review("gitlab", "Merge Request Hook", self.gl(oldrev="abc")))
-        self.assertTrue(server.is_rereview("gitlab", self.gl(oldrev="abc")))
-        self.assertFalse(server.triggers_review("gitlab", "Merge Request Hook", self.gl()))
-        self.assertFalse(server.is_rereview("gitlab", self.gl()))
+    def test_push_does_not_trigger(self):
+        self.assertFalse(server.triggers_review("gitlab", "Merge Request Hook", self.gl(oldrev="abc")))
+        self.assertFalse(server.triggers_review("github", "pull_request", {"action": "synchronize"}))
 
-    def test_push_to_a_draft_creates_no_row(self):
-        self.assertFalse(server.triggers_review("gitlab", "Merge Request Hook",
-                                                self.gl(oldrev="abc", title="Draft: wip")))
-        self.assertFalse(server.triggers_review("gitlab", "Merge Request Hook", self.gl(oldrev="abc", draft=True)))
+    def test_draft_to_ready_reads_top_level_changes(self):
+        ready = self.gl({"draft": {"previous": True, "current": False}})
+        self.assertTrue(server.triggers_review("gitlab", "Merge Request Hook", ready))
+
+    def test_bot_added_as_reviewer_triggers(self):
+        added = self.gl({"reviewers": {"previous": [{"username": "alice"}],
+                                       "current": [{"username": "alice"}, {"username": "Bot"}]}})
+        self.assertTrue(server.triggers_review("gitlab", "Merge Request Hook", added))
+        self.assertTrue(server.is_rereview("gitlab", added))
+
+    def test_other_reviewer_or_removal_does_not(self):
+        other = self.gl({"reviewers": {"previous": [], "current": [{"username": "alice"}]}})
+        removed = self.gl({"reviewers": {"previous": [{"username": "bot"}], "current": []}})
+        for payload in (other, removed):
+            self.assertFalse(server.triggers_review("gitlab", "Merge Request Hook", payload))
+
+    def test_reviewer_request_on_a_draft_is_held(self):
+        added = self.gl({"reviewers": {"previous": [], "current": [{"username": "bot"}]}}, title="Draft: wip")
+        self.assertFalse(server.triggers_review("gitlab", "Merge Request Hook", added))
+
+    def test_github_review_requested_from_the_bot_only(self):
+        ask = lambda login: {"action": "review_requested", "requested_reviewer": {"login": login}}
+        self.assertTrue(server.triggers_review("github", "pull_request", ask("bot")))
+        self.assertFalse(server.triggers_review("github", "pull_request", ask("alice")))
         self.assertFalse(server.triggers_review("github", "pull_request",
-                                                {"action": "synchronize", "pull_request": {"draft": True}}))
+                                                dict(ask("bot"), pull_request={"draft": True})))
 
-    def test_push_to_closed_mr_is_ignored(self):
-        self.assertFalse(server.triggers_review("gitlab", "Merge Request Hook",
-                                                self.gl(oldrev="abc", state="merged")))
+    def test_review_command_parsing(self):
+        note = lambda text: {"object_kind": "note", "object_attributes": {"note": text}}
+        for text in ("@bot review", "@bot re-review please", "@Bot, rereview", "@bot please recheck",
+                     "@bot can you review this?", "thanks! @bot review again"):
+            with self.subTest(text=text):
+                self.assertTrue(server.review_command("gitlab", note(text)))
+        for text in ("@bot your review is wrong here", "@bot why?", "please review @bot", "@botty review", "review"):
+            with self.subTest(text=text):
+                self.assertFalse(server.review_command("gitlab", note(text)))
 
-    def test_burst_of_pushes_enqueues_only_the_last(self):
-        fired = []
-        key = ("gitlab", 1, 1)
-        with patch.object(server, "enqueue", side_effect=fired.append):
-            for n in range(4):
-                self.assertTrue(server.debounce(("gitlab", "e", {"n": n}, {}, b"%d" % n, key), delay=0.05))
-            deadline = time.time() + 2
-            while not fired and time.time() < deadline:
-                time.sleep(0.01)
-            time.sleep(0.1)
-        self.assertEqual([job[2]["n"] for job in fired], [3])
-        self.assertNotIn(key, server._debounced)
+    def test_review_request_of_gitlab_note(self):
+        payload = {"object_kind": "note", "project_id": 1, "project": {"id": 1, "path_with_namespace": "acme/w"},
+                   "merge_request": {"iid": 2, "state": "opened", "title": "feat"},
+                   "object_attributes": {"note": "@bot review", "noteable_type": "MergeRequest", "noteable_iid": 2}}
+        event, mr = server.review_request_of("gitlab", payload)
+        self.assertEqual(event, "Merge Request Hook")
+        self.assertTrue(mr["_force"])
+        self.assertEqual(mr["object_attributes"]["iid"], 2)
+        commit = dict(payload, object_attributes={"note": "@bot review", "noteable_type": "Commit"})
+        self.assertIsNone(server.review_request_of("gitlab", commit))
 
-    def test_debounce_off_or_untargeted_enqueues_now(self):
-        self.assertFalse(server.debounce(("gitlab", "e", {}, {}, b"x", ("gitlab", 1, 1)), delay=0))
-        self.assertFalse(server.debounce(("gitlab", "e", {}, {}, b"x", None), delay=5))
+    def test_review_request_of_github_needs_a_pr(self):
+        pr = {"action": "created", "comment": {"body": "@bot review"}, "repository": {"full_name": "acme/w"},
+              "issue": {"number": 7, "pull_request": {"url": "x"}}}
+        self.assertEqual(server.review_request_of("github", pr)[1]["number"], 7)
+        issue = dict(pr, issue={"number": 7})
+        self.assertIsNone(server.review_request_of("github", issue))
 
-    def test_handler_debounces_pushes(self):
-        raw = json.dumps(self.gl(oldrev="abc")).encode()
-        server._seen.clear()
-        with patch.object(server, "debounce", return_value=True) as debounce, \
-                patch.object(server, "enqueue") as enqueue:
-            httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
-            httpd.config = {"gitlab": {"token": "t", "secret": SECRET, "url": "https://gl"}}
-            threading.Thread(target=httpd.serve_forever, daemon=True).start()
-            try:
-                request = Request(f"http://127.0.0.1:{httpd.server_address[1]}/gl-review", data=raw,
-                                  headers={"X-Gitlab-Token": SECRET, "X-Gitlab-Event": "Merge Request Hook"})
-                with urlopen(request, timeout=5) as response:
-                    self.assertEqual(response.status, 202)
-            finally:
-                httpd.shutdown()
-                httpd.server_close()
-        debounce.assert_called_once()
-        enqueue.assert_not_called()
-
-
-class PreexistingMRTests(unittest.TestCase):
-    """A push only re-reviews what the bot reviewed before; older MRs/PRs are left alone."""
-
-    def gl_collect(self, notes):
-        def fake_api_json(base, token, platform, path, body=None, accept="application/json", method=None):
-            if path == "/projects/1":
-                return {"permissions": {"project_access": {"access_level": 40}}}
-            if "/notes" in path:
-                return notes
-            if "/changes" in path:
-                return {"changes": [{"new_path": "a.py", "diff": "@@ -0,0 +1 @@\n+x"}], "overflow": False}
-            return {"author": {"username": "alice"}, "diff_refs": {"head_sha": "s"}}
-        payload = {"object_kind": "merge_request", "project": {"id": 1},
-                   "object_attributes": {"iid": 2, "action": "update", "state": "opened", "oldrev": "o"}}
-        with patch.object(server, "api_json", side_effect=fake_api_json):
-            return server.collect_gitlab(payload, GL_CONFIG)
-
-    def test_push_to_never_reviewed_mr_is_ignored(self):
-        result = self.gl_collect([{"body": "human note"}])
-        self.assertIsInstance(result, str)
-        self.assertIn("never reviewed", result)
-
-    def test_push_to_reviewed_mr_is_collected(self):
-        self.assertIsInstance(self.gl_collect([{"body": "<!-- ai-review -->\nsummary"}]), dict)
-
-    def test_github_push_to_never_reviewed_pr_is_ignored(self):
-        payload = {"action": "synchronize", "number": 5, "repository": {"full_name": "acme/w"}}
-        config = {"token": "gh", "secret": SECRET, "url": "https://api.github.com"}
-        with patch.object(server, "reviewer_of", return_value="bot"), \
-                patch.object(server, "api_json", return_value=[{"user": {"login": "alice"}}]), \
-                patch.object(server, "api") as api:
-            self.assertIn("never reviewed", server.collect_github(payload, config))
-        api.assert_not_called()  # no diff fetched for an ignored push
-        with patch.object(server, "reviewer_of", return_value="bot"), \
-                patch.object(server, "api_json", return_value=[{"user": {"login": "bot"}}]):
-            self.assertTrue(server.gh_reviewed_before("https://api.github.com", "gh", "acme/w", 5))
+    def test_command_comment_runs_a_review_not_a_debate(self):
+        payload = {"object_kind": "note", "project_id": 1, "project": {"id": 1, "path_with_namespace": "acme/w"},
+                   "user": {"username": "alice"}, "merge_request": {"iid": 2, "state": "opened"},
+                   "object_attributes": {"note": "@bot re-review", "noteable_type": "MergeRequest",
+                                         "noteable_iid": 2, "discussion_id": "d", "id": 9}}
+        tracker = server.Tracker(os.path.join(tempfile.mkdtemp(), "r.jsonl"))
+        saved = server._tracker
+        server._tracker = tracker
+        try:
+            with patch.object(server, "process", return_value=True) as process, \
+                    patch.object(server, "debate") as debate, \
+                    patch.object(server, "api") as api:
+                server.run_job("gitlab", "Note Hook", payload, GL_CONFIG, b"raw", None)
+        finally:
+            server._tracker = saved
+        debate.assert_not_called()
+        event, mr = process.call_args[0][1], process.call_args[0][2]
+        self.assertEqual((event, mr["_force"], mr["object_attributes"]["iid"]), ("Merge Request Hook", True, 2))
+        self.assertIn("/notes/9/award_emoji", api.call_args[0][3])  # eyes reaction
+        row = tracker.snapshot()["history"][0]
+        self.assertEqual((row["status"], row["remark"]), ("done", "review requested by @alice"))
 
 
 class RereviewFlowTests(unittest.TestCase):
@@ -2451,7 +2451,7 @@ class RereviewFlowTests(unittest.TestCase):
                 return {"user_has_approved": approved}
             return {}
         payload = {"object_kind": "merge_request", "project": {"id": 1, "path_with_namespace": "acme/w"},
-                   "object_attributes": {"iid": 2, "action": "update", "state": "opened", "oldrev": "sha1"}}
+                   "object_attributes": {"iid": 2, "action": "open", "state": "opened"}, "_force": True}
         with patch.object(server, "collect_gitlab", return_value=dict(self.JOB)), \
                 patch.object(server, "api_json", side_effect=fake_api_json), \
                 patch.object(server, "api"), patch.object(server, "reviewer_of", return_value="bot"), \
@@ -2465,7 +2465,7 @@ class RereviewFlowTests(unittest.TestCase):
 
     def test_prompt_lists_open_findings(self):
         prompt, _ = self.run_push("ok\nVERDICT: APPROVE")
-        self.assertIn("re-review after new commits", prompt)
+        self.assertIn("requested re-review", prompt)
         self.assertIn("`a.py:1` WARNING: Null deref.", prompt)
 
     def test_request_changes_withdraws_our_approval(self):

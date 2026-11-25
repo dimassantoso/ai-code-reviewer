@@ -41,8 +41,6 @@ MAX_DEBATE_DIFF = 20_000  # diff context handed to a debate reply
 MAX_INLINE = int(os.getenv("MAX_INLINE", "20"))  # inline comments posted per review
 DASHBOARD_USER = os.getenv("DASHBOARD_USER", "admin")
 DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")  # blank = dashboard is open
-# Pushes arriving in a burst are coalesced: the review runs this long after the last one.
-PUSH_DEBOUNCE_S = float(os.getenv("PUSH_DEBOUNCE_S", "60"))
 # Conceded findings fed back into later reviews of the same repo.
 LESSONS_IN_PROMPT = int(os.getenv("LESSONS_IN_PROMPT", "10"))
 
@@ -1325,14 +1323,6 @@ def gh_open_findings(base, token, full_name, number, me):
     return found[:30]
 
 
-def gh_reviewed_before(base, token, full_name, number):
-    """True when the token account already left a review on this PR."""
-    me = reviewer_of("github", base, token)
-    reviews = api_json(base, token, "github", f"/repos/{full_name}/pulls/{number}/reviews?per_page=100")
-    return bool(me) and isinstance(reviews, list) and any(
-        (r.get("user") or {}).get("login") == me for r in reviews)
-
-
 def gh_dismiss_approvals(base, token, full_name, number, me):
     """Dismiss our earlier APPROVED reviews when a re-review now requests changes."""
     if not me:
@@ -1408,17 +1398,11 @@ def collect_gitlab(payload, config):
         LOG.info("project %s: access %s < MIN_ACCESS_LEVEL %s, skipping", pid, level, MIN_ACCESS_LEVEL)
         return "your token has access level %s, below MIN_ACCESS_LEVEL %s" % (level, MIN_ACCESS_LEVEL)
     path = f"/projects/{pid}/merge_requests/{iid}"
-    if attrs.get("action") == "open" or pushed(payload):
+    if attrs.get("action") == "open" and not payload.get("_force"):
         notes = api_json(base, token, "gitlab", path + "/notes?per_page=100&sort=desc")
-        reviewed = isinstance(notes, list) and any(REVIEW_MARKER in (n.get("body") or "") for n in notes)
-        if attrs.get("action") == "open" and reviewed and not payload.get("_force"):
+        if isinstance(notes, list) and any(REVIEW_MARKER in (n.get("body") or "") for n in notes):
             LOG.info("MR !%s already reviewed on open, skipping", iid)
             return "already reviewed when it was opened"
-        if pushed(payload) and not reviewed:
-            # A push only re-reviews what we reviewed before: MRs that existed before the
-            # reviewer was installed (or never left draft) are not picked up by a push.
-            LOG.info("MR !%s never reviewed, push ignored", iid)
-            return "push to an MR the reviewer never reviewed (opened before it was installed, or still awaiting its first review)"
     changes = api_json(base, token, "gitlab", path + "/changes?access_raw_diffs=true")
     if not isinstance(changes, dict) or changes.get("overflow") or not isinstance(changes.get("changes"), list):
         raise ValueError("incomplete merge request diff")
@@ -1452,9 +1436,6 @@ def collect_github(payload, config):
     if not positive(number) or not is_repo_name(full_name):
         raise ValueError("missing pull request destination")
     base, token = config["url"], config["token"]
-    if payload.get("action") in PR_PUSH_ACTIONS and not gh_reviewed_before(base, token, full_name, number):
-        LOG.info("%s#%s never reviewed, push ignored", full_name, number)
-        return "push to a PR the reviewer never reviewed (opened before it was installed, or still awaiting its first review)"
     raw = api(base, token, "github", f"/repos/{full_name}/pulls/{number}",
               accept="application/vnd.github.v3.diff").decode("utf-8")
     if not raw.strip():
@@ -1494,8 +1475,8 @@ def process(platform, event, payload, config, track=None):
             return skip("not a merge request event (%s)" % (event or "no event header"))
         action = attrs.get("action") if isinstance(attrs, dict) else "?"
         if not isinstance(attrs, dict) or not (payload.get("_force") or gl_triggers(payload)):
-            return skip("MR action %r does not trigger a review; only a new MR, a push, "
-                        "or marking it ready does" % action)
+            return skip("MR action %r does not trigger a review; only a new MR, marking it ready, "
+                        "or adding the bot as reviewer does" % action)
         state = (attrs.get("state") or "").lower()
         if state and state != "opened":
             return skip("MR is %s; only open merge requests are reviewed" % state)
@@ -1519,7 +1500,7 @@ def process(platform, event, payload, config, track=None):
     key = review_key(platform, job)
     head = job.get("head") or ""
     with _reviewed_lock:
-        if head and _reviewed.get(key) == head and not payload.get("_force"):
+        if head and _reviewed.get(key) == head and not is_rereview(platform, payload):
             LOG.info("%s unchanged since last review (head %s), skipping", key, head[:8])
             return skip("code unchanged since the last review (head %s)" % head[:8])
     if job.get("draft"):
@@ -1583,7 +1564,7 @@ def process(platform, event, payload, config, track=None):
 
 
 PRIOR_RULES = (
-    "This is a re-review after new commits. Your findings from the previous review that are "
+    "This is a requested re-review. Your findings from the previous review that are "
     "still open:\n%s\n"
     "Re-list a finding only if the problem is still present, at its current line. Drop findings "
     "that are fixed. Do not raise new issues about code that is unchanged since you accepted it; "
@@ -1657,6 +1638,14 @@ def run_job(platform, event, payload, cfg, raw, key):
         if not verdict.reply:
             LOG.info("%s comment ignored: %s", platform, verdict.reason)
             return
+    review_event = review_payload = None
+    if verdict is not None and review_command(platform, payload):
+        request = review_request_of(platform, payload)
+        if request is None:
+            LOG.info("%s review command outside a merge request ignored", platform)
+            return
+        review_event, review_payload = request
+        acknowledge(platform, payload, cfg)
     target = label_of(platform, payload)
     rec = _tracker.begin(platform, target,
                          author_of(payload) or _tracker.author_of_target(target),
@@ -1672,7 +1661,10 @@ def run_job(platform, event, payload, cfg, raw, key):
     _current.job = rec["id"]
     try:
         with target_lock(key):
-            if is_note_event(platform, payload):
+            if review_payload is not None:
+                fields["remark"] = "review requested by @%s" % verdict.ctx.get("commenter", "?")
+                posted = process(platform, review_event, review_payload, cfg, track)
+            elif is_note_event(platform, payload):
                 posted = debate(platform, payload, cfg, track, verdict)
             else:
                 posted = process(platform, event, payload, cfg, track)
@@ -1763,40 +1755,62 @@ def author_of(payload):
         return ""
 
 
-# A review runs when the MR/PR is created, when a draft is marked ready, and after
-# every push of new commits. Title, label, description and assignee edits are also
-# `update` / `edited` hooks and are ignored. Pushes are debounced (PUSH_DEBOUNCE_S).
+# A review runs only when someone asks for one: the MR/PR is created, a draft is marked
+# ready, the bot is added as a reviewer (GitHub's "re-request review" button sends the
+# same event), or a comment says `@bot review`. Pushes, edits and reopens never do.
 REVIEW_ACTIONS = {"open"}
-PR_ACTIONS = {"opened", "ready_for_review", "synchronize"}
-PR_PUSH_ACTIONS = {"synchronize"}
+PR_ACTIONS = {"opened", "ready_for_review", "review_requested"}
+# `@bot review`, `@bot re-review`, `@bot please recheck`, `@bot can you review this`
+REVIEW_COMMAND = re.compile(r"(?:please\s+|pls\s+|can you\s+|could you\s+)?(?:re-?review|review|re-?check)\b", re.I)
 
 
-def pushed(payload):
-    """GitLab `update` that carries new commits: GitLab sets `oldrev` only for pushes."""
-    attrs = payload.get("object_attributes") or {}
-    return attrs.get("action") == "update" and bool(attrs.get("oldrev"))
+def hook_changes(payload):
+    """GitLab puts `changes` at the top level of an MR hook, not under object_attributes."""
+    return payload.get("changes") or (payload.get("object_attributes") or {}).get("changes") or {}
+
+
+def _before_after(change):
+    if isinstance(change, dict):
+        return change.get("previous"), change.get("current")
+    if isinstance(change, list) and len(change) == 2:  # older GitLab: [previous, current]
+        return change[0], change[1]
+    return None
+
+
+def gl_reviewer_added(payload):
+    """GitLab MR `update` whose reviewer list newly includes the bot."""
+    pair = _before_after(hook_changes(payload).get("reviewers"))
+    if not BOT_USERNAME or not pair:
+        return False
+    names = lambda users: {str((u or {}).get("username", "")).lower() for u in users or [] if isinstance(u, dict)}
+    bot = BOT_USERNAME.lower()
+    return bot in names(pair[1]) and bot not in names(pair[0])
+
+
+def requested(platform, payload):
+    """The bot was explicitly asked to review: added as reviewer, or re-requested."""
+    if not isinstance(payload, dict) or not BOT_USERNAME:
+        return False
+    if platform == "gitlab":
+        return (payload.get("object_attributes") or {}).get("action") == "update" and gl_reviewer_added(payload)
+    return (payload.get("action") == "review_requested"
+            and str((payload.get("requested_reviewer") or {}).get("login", "")).lower() == BOT_USERNAME.lower())
 
 
 def is_rereview(platform, payload):
-    """True for a push to an existing MR/PR, or a re-review asked for from the dashboard."""
-    if not isinstance(payload, dict):
-        return False
-    if payload.get("_force"):
-        return True
-    if platform == "gitlab":
-        return payload.get("object_kind") == "merge_request" and pushed(payload)
-    return payload.get("action") in PR_PUSH_ACTIONS
+    """An explicit request (reviewer assignment, `@bot review`, dashboard): carry prior findings."""
+    return isinstance(payload, dict) and bool(payload.get("_force") or requested(platform, payload))
 
 
 def gl_triggers(payload):
-    """GitLab MR actions that start a review: open, draft -> ready, or a push."""
+    """GitLab MR actions that start a review: open, draft -> ready, or the bot added as reviewer."""
     attrs = payload.get("object_attributes") or {}
     action = attrs.get("action")
-    return action in REVIEW_ACTIONS or (action == "update" and (became_ready(payload) or pushed(payload)))
+    return action in REVIEW_ACTIONS or (action == "update" and (became_ready(payload) or gl_reviewer_added(payload)))
 
 
 def is_draft_event(platform, payload):
-    """Draft state as the hook reports it: pushes to a draft are dropped before a row exists."""
+    """Draft state as the hook reports it: a request on a draft is dropped before a row exists."""
     if platform == "gitlab":
         attrs = payload.get("object_attributes") or {}
         return bool(attrs.get("draft") or attrs.get("work_in_progress")
@@ -1806,19 +1820,72 @@ def is_draft_event(platform, payload):
 
 def became_ready(payload):
     """True when an `update` hook is the draft -> ready transition, not an edit."""
-    attrs = payload.get("object_attributes") or {}
-    change = (attrs.get("changes") or {}).get("draft")
-    if change is None:  # older GitLab sends [previous, current]; newer sends previous/current
-        change = (attrs.get("changes") or {}).get("title")
-    if isinstance(change, dict):
-        before, after = change.get("previous"), change.get("current")
-    elif isinstance(change, list) and len(change) == 2:
-        before, after = change
-    else:
+    changes = hook_changes(payload)
+    pair = _before_after(changes.get("draft")) or _before_after(changes.get("title"))
+    if not pair:
         return False
+    before, after = pair
     was = bool(before) if isinstance(before, bool) else bool(re.match(r"(?i)^\s*(draft|wip)\b", str(before or "")))
     now = bool(after) if isinstance(after, bool) else bool(re.match(r"(?i)^\s*(draft|wip)\b", str(after or "")))
     return was and not now
+
+
+def note_text(platform, payload):
+    if platform == "gitlab":
+        return (payload.get("object_attributes") or {}).get("note") or ""
+    return (payload.get("comment") or {}).get("body") or ""
+
+
+def review_command(platform, payload):
+    """A comment that tells the bot to review: `@bot review` / `re-review` / `recheck`."""
+    if not BOT_USERNAME or not is_note_event(platform, payload):
+        return False
+    text = note_text(platform, payload)
+    mention = re.search(rf"(?<![\w-])@{re.escape(BOT_USERNAME)}(?![\w-])[\s,:]*", text, re.I)
+    return bool(mention and REVIEW_COMMAND.match(text, mention.end()))
+
+
+def review_request_of(platform, payload):
+    """(event, MR/PR-shaped payload) for a `@bot review` comment, or None if it is not on an MR/PR."""
+    if platform == "gitlab":
+        mr = payload.get("merge_request") or {}
+        attrs = payload.get("object_attributes") or {}
+        pid = payload.get("project_id") or (payload.get("project") or {}).get("id")
+        iid = mr.get("iid") or attrs.get("noteable_iid")
+        if attrs.get("noteable_type") != "MergeRequest" or not positive(pid) or not positive(iid):
+            return None
+        return "Merge Request Hook", {
+            "object_kind": "merge_request", "_force": True, "project": payload.get("project") or {"id": pid},
+            "object_attributes": {"iid": iid, "action": "open", "state": mr.get("state") or "opened",
+                                  "title": mr.get("title") or "", "draft": bool(mr.get("draft")),
+                                  "url": mr.get("url") or ""}}
+    issue = payload.get("issue") or {}
+    pr = payload.get("pull_request") or {}
+    number = pr.get("number") or (issue.get("number") if issue.get("pull_request") else None)
+    repo = (payload.get("repository") or {}).get("full_name")
+    if not positive(number) or not is_repo_name(repo):
+        return None
+    return "pull_request", {"action": "opened", "_force": True, "number": number,
+                            "repository": {"full_name": repo}}
+
+
+def acknowledge(platform, payload, cfg):
+    """React with eyes on a `@bot review` comment so the requester sees it was picked up."""
+    try:
+        if platform == "gitlab":
+            attrs = payload.get("object_attributes") or {}
+            pid = payload.get("project_id") or (payload.get("project") or {}).get("id")
+            iid = (payload.get("merge_request") or {}).get("iid") or attrs.get("noteable_iid")
+            api(cfg["url"] + "/api/v4", cfg["token"], "gitlab",
+                f"/projects/{pid}/merge_requests/{iid}/notes/{attrs.get('id')}/award_emoji", {"name": "eyes"})
+        else:
+            comment = payload.get("comment") or {}
+            repo = (payload.get("repository") or {}).get("full_name")
+            kind = "pulls" if "pull_request_review_id" in comment else "issues"
+            api(cfg["url"], cfg["token"], "github", f"/repos/{repo}/{kind}/comments/{comment.get('id')}/reactions",
+                {"content": "eyes"})
+    except (HTTPError, URLError, ValueError, OSError) as error:
+        LOG.info("could not react to the review request: %s", error)
 
 
 def triggers_review(platform, event, payload):
@@ -1845,7 +1912,9 @@ def triggers_review(platform, event, payload):
                 return False  # closed/merged are ignored, not recorded
         elif event != "pull_request" or payload.get("action") not in PR_ACTIONS:
             return False
-        return not (is_rereview(platform, payload) and is_draft_event(platform, payload))
+        elif payload.get("action") == "review_requested" and not requested(platform, payload):
+            return False  # a review was requested from someone else
+        return not (requested(platform, payload) and is_draft_event(platform, payload))
     except (AttributeError, TypeError):
         return False
 
@@ -1947,45 +2016,6 @@ def enqueue(job):
     """Hand a job to the worker pool. Raises queue.Full / RuntimeError when it cannot."""
     start_workers()
     _jobs.put_nowait(job)
-
-
-_debounced = {}  # target -> Timer for the latest push; older pushes are cancelled
-_debounced_lock = threading.Lock()
-
-
-def debounce(job, delay=None):
-    """Hold a push review until pushes to that target stop for `delay` seconds.
-
-    A burst of N pushes costs one model run on the newest head instead of N. Returns False
-    when debouncing does not apply (disabled, or no target identity), so the caller enqueues
-    at once. The collector fetches the live head, so the older payload in a fired job is fine.
-    """
-    delay = PUSH_DEBOUNCE_S if delay is None else delay
-    key = job[5]
-    if delay <= 0 or key is None:
-        return False
-    timer = threading.Timer(delay, fire_debounced, (key, job))
-    timer.daemon = True
-    with _debounced_lock:
-        older = _debounced.pop(key, None)
-        if older is not None:
-            older.cancel()
-            LOG.info("%s: newer push within %ss, earlier push review dropped", key, delay)
-        _debounced[key] = timer
-    timer.start()
-    return True
-
-
-def fire_debounced(key, job):
-    with _debounced_lock:
-        if _debounced.get(key) is not threading.current_thread():
-            return  # superseded by a newer push after this timer fired
-        del _debounced[key]
-    try:
-        enqueue(job)
-    except (queue.Full, RuntimeError):
-        LOG.warning("%s: queue full, push review dropped", key)
-        release(job[0], job[4])
 
 
 def claim(platform, raw):
@@ -2213,8 +2243,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond(200, "duplicate")
             # Ack before the slow review: GitLab/GitHub time out webhooks at 10s.
             job = (platform, event, payload, cfg, raw, target_of(platform, payload))
-            if is_rereview(platform, payload) and debounce(job):
-                return self.respond(202, "accepted")
             try:
                 enqueue(job)
             except (queue.Full, RuntimeError):  # pool full or workers cannot start
