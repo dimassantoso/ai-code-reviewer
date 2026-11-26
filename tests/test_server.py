@@ -764,6 +764,61 @@ class InlineTests(unittest.TestCase):
         self.assertEqual(calls[0][1]["position"]["new_line"], 31)
         self.assertEqual(calls[0][1]["position"]["position_type"], "text")
 
+    CHANGES = [{"new_path": "src/auth.py", "diff": "@@ -28,4 +30,4 @@\n a\n+b\n"}]
+    PATH = "/projects/1/merge_requests/2"
+
+    def test_review_published_as_one_batch_of_drafts(self):
+        calls = []
+
+        def fake_api(base, token, platform, path, body=None, accept="application/json", method=None):
+            calls.append((path, body, method))
+            if path.endswith("/draft_notes") and body is None:
+                return b'[{"id": 5, "note": "<!-- ai-review -->\\nstale"}, {"id": 6, "note": "human"}]'
+            return b'{"id": 9}'
+
+        with patch.object(server, "api", side_effect=fake_api):
+            posted = server.gl_publish_review("https://gl/api/v4", "t", self.PATH, self.REVIEW,
+                                              self.CHANGES, {"base_sha": "b", "head_sha": "h"},
+                                              lambda done: "summary %d" % len(done))
+        self.assertEqual(posted, {("src/auth.py", 31)})
+        paths = [c[0] for c in calls]
+        self.assertEqual(paths, [self.PATH + "/draft_notes", self.PATH + "/draft_notes/5",
+                                 self.PATH + "/draft_notes", self.PATH + "/draft_notes",
+                                 self.PATH + "/draft_notes/bulk_publish"])
+        self.assertEqual(calls[1][2], "DELETE")  # only our own stale draft is discarded
+        self.assertEqual(calls[2][1]["position"]["new_line"], 31)
+        self.assertEqual(calls[3][1], {"note": "summary 1"})
+        self.assertFalse(any(p.endswith("/discussions") or p.endswith("/notes") for p in paths))
+
+    def test_falls_back_to_discussions_without_draft_notes_api(self):
+        calls = []
+
+        def fake_api(base, token, platform, path, body=None, accept="application/json", method=None):
+            calls.append(path)
+            if "/draft_notes" in path:
+                raise server.HTTPError(path, 404, "Not Found", {}, None)
+            return b'{"id": 9}'
+
+        with patch.object(server, "api", side_effect=fake_api):
+            posted = server.gl_publish_review("https://gl/api/v4", "t", self.PATH, self.REVIEW,
+                                              self.CHANGES, {"base_sha": "b", "head_sha": "h"},
+                                              lambda done: "summary")
+        self.assertEqual(posted, {("src/auth.py", 31)})
+        self.assertIn(self.PATH + "/discussions", calls)
+        self.assertEqual(calls[-1], self.PATH + "/notes")
+
+    def test_no_inline_posts_only_the_summary_note(self):
+        calls = []
+
+        def fake_api(base, token, platform, path, body=None, accept="application/json", method=None):
+            calls.append(path)
+            return b'{"id": 9}'
+
+        with patch.object(server, "api", side_effect=fake_api):
+            posted = server.gl_publish_review("https://gl/api/v4", "t", self.PATH,
+                                              "Fine.\nVERDICT: APPROVE", self.CHANGES, {}, lambda done: "s")
+        self.assertEqual((posted, calls), (set(), [self.PATH + "/notes"]))
+
 
 REAL_MODEL_REVIEW = """**Verdict:** \U0001f534 REQUEST_CHANGES
 

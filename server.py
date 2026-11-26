@@ -871,15 +871,14 @@ def gl_access_level(base, token, pid):
     return level
 
 
-def gl_post_inline(base, token, path, review, changes, refs):
-    """Post each parsed inline comment that lands on a real new-side diff line."""
+def gl_inline_notes(review, changes, refs):
+    """(key, body, position) for each parsed inline comment on a real new-side diff line."""
     valid = {}
     for change in changes:
         file_path = change.get("new_path") or change.get("old_path", "")
         valid[file_path] = new_lines_of(change.get("diff"))
-    done = set()
-    comments = parse_inline_comments(review)
-    for comment in comments:
+    notes = []
+    for comment in parse_inline_comments(review):
         if comment["line"] not in valid.get(comment["file"], set()):
             LOG.info("inline %s:%s not in diff, skipping", comment["file"], comment["line"])
             continue
@@ -891,13 +890,60 @@ def gl_post_inline(base, token, path, review, changes, refs):
                     "start_sha": refs.get("start_sha") or refs.get("base_sha", ""),
                     "head_sha": refs.get("head_sha", ""),
                     "new_path": comment["file"], "new_line": comment["line"]}
+        notes.append(((comment["file"], comment["line"]), body, position))
+    return notes
+
+
+def gl_post_inline(base, token, path, review, changes, refs):
+    """Post each inline comment as its own discussion (one notification each)."""
+    done = set()
+    notes = gl_inline_notes(review, changes, refs)
+    for key, body, position in notes:
         if "id" in api_json(base, token, "gitlab", path + "/discussions",
                             {"body": body, "position": position}):
-            done.add((comment["file"], comment["line"]))
+            done.add(key)
         if len(done) >= MAX_INLINE:
             LOG.info("inline cap %s reached, %s finding(s) stay in the summary",
-                     MAX_INLINE, len(comments) - len(done))
+                     MAX_INLINE, len(notes) - len(done))
             break
+    return done
+
+
+def gl_discard_drafts(base, token, path):
+    """Delete the bot's unpublished draft notes, so bulk_publish never releases leftovers."""
+    drafts = api_json(base, token, "gitlab", path + "/draft_notes")
+    for draft in drafts if isinstance(drafts, list) else []:
+        if REVIEW_MARKER in (draft.get("note") or ""):
+            api(base, token, "gitlab", f"{path}/draft_notes/{draft.get('id')}", method="DELETE")
+
+
+def gl_publish_review(base, token, path, review, changes, refs, summary):
+    """Post inline comments plus the summary as ONE GitLab review, so watchers get one email.
+
+    Every comment is created as a draft note and released with a single bulk_publish.
+    `summary(posted)` builds the summary body from the set of inline keys that landed.
+    Older GitLab without the draft notes API falls back to one discussion per comment.
+    """
+    notes = gl_inline_notes(review, changes, refs)[:MAX_INLINE]
+    if notes:
+        try:
+            gl_discard_drafts(base, token, path)
+            done = set()
+            for key, body, position in notes:
+                if "id" in api_json(base, token, "gitlab", path + "/draft_notes",
+                                    {"note": body, "position": position}):
+                    done.add(key)
+            api_json(base, token, "gitlab", path + "/draft_notes", {"note": summary(done)})
+            api(base, token, "gitlab", path + "/draft_notes/bulk_publish", {})
+            return done
+        except HTTPError as error:
+            LOG.warning("draft notes failed (%s), posting comments one by one", error)
+            try:
+                gl_discard_drafts(base, token, path)
+            except (HTTPError, URLError, ValueError, OSError) as cleanup:
+                LOG.warning("could not discard draft notes: %s", cleanup)
+    done = gl_post_inline(base, token, path, review, changes, refs) if notes else set()
+    api(base, token, "gitlab", path + "/notes", {"body": summary(done)})
     return done
 
 
@@ -1519,7 +1565,9 @@ def process(platform, event, payload, config, track=None):
     verdict = verdict_of(review)
     mark("posting", verdict=verdict)
     if platform == "gitlab":
-        inline = gl_post_inline(job["base"], job["token"], job["path"], review, job["files"], job["refs"])
+        inline = gl_publish_review(
+            job["base"], job["token"], job["path"], review, job["files"], job["refs"],
+            lambda posted: review_body(review, job["author"], verdict, posted=posted, reviewer=reviewer))
         try:
             closed = gl_resolve_fixed(job["base"], job["token"], job["pid"], job["iid"],
                                       review, reviewer)
@@ -1527,8 +1575,6 @@ def process(platform, event, payload, config, track=None):
                 mark("posting", remark="%d fixed finding(s) resolved" % closed)
         except (HTTPError, URLError, ValueError, OSError) as error:
             LOG.warning("could not resolve fixed findings: %s", error)
-        api(job["base"], job["token"], "gitlab", job["path"] + "/notes",
-            {"body": review_body(review, job["author"], verdict, posted=inline, reviewer=reviewer)})
         LOG.info("MR reviewed: verdict=%s inline=%d access=%s", verdict, len(inline), job["level"])
         mark("posting", inline=len(inline))
         if verdict == "APPROVE" and job["level"] >= APPROVE_ACCESS_LEVEL:
